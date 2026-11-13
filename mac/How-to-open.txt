@@ -16,13 +16,19 @@ USING IT
   1. Double-click the app. One window opens with Bin A and Bin B side by side.
   2. Click Choose... on each side, or drag the .avb bin files in from Finder
      (drag both at once to fill A and B together; the arrows button swaps them).
-  3. Click Compare. The report opens in your web browser.
-  The window stays open, so you can compare another pair straight away.
+  3. Click Compare. The report opens in its own window.
+  4. Under "Differences by column", tick the columns you want to see
+     (Duration, Start, End, Scene, ...). The report updates as you tick.
+     Bin Diff remembers your choice for next time.
+  5. Click Export PDF... to save what you're looking at as a PDF.
+     (More > Print, Export HTML, Export CSV, Open in Browser.)
+  The main window stays open, so you can compare another pair straight away.
 
 SETTINGS (gear button, or Bin Diff > Settings...)
   Columns: which columns are compared (new columns are added as you compare bins).
   Report:  which sections appear, and the duration table's columns.
-  General: where reports are saved, and duration/tape matching options.
+  General: where PDFs and saved reports go, optional automatic saving, and
+           duration/tape matching options.
   Your settings are kept when you quit or update.
 
 UPDATES
@@ -34,7 +40,7 @@ PROBLEMS?
   Use the "Report a Bug..." button. It opens a ready-to-send GitHub issue
   (needs a free GitHub account).
 
-Reports are saved in Documents > Bin Diff Reports (HTML + a CSV for Excel).
+Exports are saved in Documents > Bin Diff Reports unless you choose another folder.
 
 Bin Diff by Alex Stuart. Free software under the GNU GPL v3:
 https://github.com/absolute-cinema-jpg/bin-diff

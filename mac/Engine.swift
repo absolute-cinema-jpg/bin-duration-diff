@@ -20,6 +20,9 @@ struct Summary: Decodable {
     let columns: [String]?
     let columns_only_a: [String]?
     let columns_only_b: [String]?
+    // Added in 2.1
+    let bin_a: String?
+    let bin_b: String?
 }
 
 enum EngineError: LocalizedError {
@@ -34,7 +37,10 @@ func engineOptions(fps: String) -> [String] {
     if tol > 0 { args += ["--tolerance", String(tol)] }
     if Prefs.bool(Prefs.caseSensitive, false) { args.append("--case-sensitive") }
     if Prefs.bool(Prefs.includeSubclips, false) { args.append("--include-subclips") }
-    if !Prefs.bool(Prefs.writeCSV, true) { args.append("--no-csv") }
+    // The CSV is always made (for Export CSV) unless reports are auto-saved without one.
+    if Prefs.bool(Prefs.autoSave, false) && !Prefs.bool(Prefs.writeCSV, true) { args.append("--no-csv") }
+    let unchecked = (UserDefaults.standard.stringArray(forKey: Prefs.reportUnchecked) ?? []).filter { !$0.contains(",") }
+    if !unchecked.isEmpty { args += ["--unchecked", unchecked.joined(separator: ",")] }
     if Prefs.bool(Prefs.ignoreValueCase, false) { args.append("--ignore-value-case") }
     let ignored = ColumnPrefs.shared.ignored.filter { !$0.contains(",") }
     if !ignored.isEmpty { args += ["--ignore-columns", ignored.joined(separator: ",")] }
@@ -56,7 +62,9 @@ func runEngine(binA: URL, binB: URL, options: [String]) throws -> Summary {
         let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH.mm.ss"; return f.string(from: Date())
     }()
     let name = "\(binA.deletingPathExtension().lastPathComponent) vs \(binB.deletingPathExtension().lastPathComponent) \(stamp).html"
-    let out = Prefs.reportsFolderURL.appendingPathComponent(name)
+    // Auto-saved reports go to the reports folder; otherwise to a work folder the app tidies.
+    let folder = Prefs.bool(Prefs.autoSave, false) ? Prefs.reportsFolderURL : Prefs.workFolderURL
+    let out = folder.appendingPathComponent(name)
 
     let p = Process()
     p.executableURL = engine

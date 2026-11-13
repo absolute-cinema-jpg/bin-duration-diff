@@ -764,6 +764,7 @@ h1{font-size:22px;margin:0 0 4px}h2{font-size:16px;margin:32px 0 10px}
 .card .n{font-size:24px;font-weight:650;font-variant-numeric:tabular-nums}
 .card .l{color:var(--muted);font-size:12px}
 .card.hot .n{color:var(--long)}
+.card.dim{opacity:.35}
 .wrap{overflow-x:auto;background:var(--panel);border:1px solid var(--line);border-radius:10px}
 table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
 th,td{padding:7px 10px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
@@ -773,7 +774,7 @@ tr:last-child td{border-bottom:0}
 td.num,th.num{text-align:right}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}
 .long{color:var(--long)}.short{color:var(--short)}
-.barcell{min-width:140px}
+.barcell{min-width:140px;width:40%}
 .bar{height:8px;border-radius:4px;background:var(--accent);opacity:.8}
 .note{color:var(--warn);font-size:12px}
 .muted{color:var(--muted)}
@@ -785,9 +786,64 @@ td.num,th.num{text-align:right}
 details{margin-top:8px}summary{cursor:pointer;color:var(--muted)}
 footer{margin-top:48px;color:var(--muted);font-size:11px;opacity:.7}
 .filter{margin:0 0 10px;padding:7px 10px;width:100%;max-width:320px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--ink)}
+.toolbar{display:flex;gap:8px;align-items:center;margin:0 0 10px}
+.toolbar button{font:inherit;font-size:12px;padding:4px 10px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--ink);cursor:pointer}
+.toolbar .hint{color:var(--muted);font-size:12px}
+#bycol tr.colrow{cursor:pointer}
+#bycol tr.colrow.off td{opacity:.4}
+#bycol td.cb{width:28px}
+#bycol input{width:16px;height:16px;cursor:pointer;accent-color:var(--accent)}
+.colhidden{display:none!important}
+@media print{
+  :root{--bg:#fff;--panel:#fff;--ink:#111;--muted:#666;--line:#ccc;--accent:#2f5bd3;--long:#a14a14;--short:#1f6b4c;
+        --warn:#7a5d00;--warnbg:#fff6d9;--olda:#fbe7e1;--newb:#e2f2e8}
+  *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  body{font-size:10.5px}
+  main{max-width:none;padding:0}
+  h1{font-size:18px}h2{font-size:13px;margin:18px 0 6px;break-after:avoid}
+  .noprint,.filter,.toolbar,#bycol tr.off,#bycol td.cb,#bycol th.cb,details.zero{display:none!important}
+  .wrap{overflow:visible;border-radius:4px}
+  th{position:static}
+  th,td{white-space:normal;padding:4px 6px}
+  td.wrapcell{max-width:none}
+  .mono{font-size:10px}
+  .card{padding:6px 8px}.card .n{font-size:16px}
+  tr,.card{break-inside:avoid}
+  footer{margin-top:20px}
+}
 """
 
 JS = """
+(function(){
+var body=document.body, unchecked=new Set();
+try{JSON.parse(body.dataset.unchecked||'[]').forEach(function(c){unchecked.add(c)})}catch(e){}
+function setText(id,v){var el=document.getElementById(id);if(el)el.textContent=v}
+function apply(notify){
+  document.querySelectorAll('#bycol tr.colrow').forEach(function(r){
+    var on=!unchecked.has(r.dataset.col);r.classList.toggle('off',!on);
+    var cb=r.querySelector('input');if(cb)cb.checked=on});
+  var clips=new Set(),shown=0;
+  document.querySelectorAll('#metadata tbody tr').forEach(function(r){
+    var on=!unchecked.has(r.dataset.col);r.classList.toggle('colhidden',!on);
+    if(on){shown++;clips.add(r.dataset.pair)}});
+  var durOn=!unchecked.has('duration');
+  var ds=document.getElementById('sec-durations');if(ds)ds.classList.toggle('colhidden',!durOn);
+  document.querySelectorAll('.card.c-dur').forEach(function(c){c.classList.toggle('dim',!durOn)});
+  if(durOn)document.querySelectorAll('#durations tbody tr').forEach(function(r){clips.add(r.dataset.pair)});
+  setText('n-meta',shown);setText('h-meta',shown);setText('n-clips',clips.size);
+  var none=document.getElementById('meta-none');if(none)none.classList.toggle('colhidden',shown>0||!document.querySelector('#metadata'));
+  var mt=document.getElementById('meta-table');if(mt)mt.classList.toggle('colhidden',shown==0);
+  var list=Array.from(unchecked);body.dataset.unchecked=JSON.stringify(list);
+  if(notify&&window.webkit&&webkit.messageHandlers&&webkit.messageHandlers.bindiff)
+    webkit.messageHandlers.bindiff.postMessage({unchecked:list});
+}
+document.querySelectorAll('#bycol tr.colrow').forEach(function(r){
+  r.addEventListener('click',function(ev){
+    var c=r.dataset.col;if(unchecked.has(c))unchecked.delete(c);else unchecked.add(c);apply(true)})});
+document.querySelectorAll('[data-act]').forEach(function(b){b.addEventListener('click',function(){
+  var rows=document.querySelectorAll('#bycol tr.colrow');
+  rows.forEach(function(r){if(b.dataset.act==='all')unchecked.delete(r.dataset.col);else unchecked.add(r.dataset.col)});
+  apply(true)})});
 document.querySelectorAll('table.sortable').forEach(function(t){
   t.querySelectorAll('th').forEach(function(th,i){th.addEventListener('click',function(){
     var b=t.tBodies[0],rows=[].slice.call(b.rows),asc=th.dataset.asc!=='1';th.dataset.asc=asc?'1':'0';
@@ -796,6 +852,9 @@ document.querySelectorAll('table.sortable').forEach(function(t){
     rows.forEach(function(r){b.appendChild(r)});});});});
 document.querySelectorAll('input.filter').forEach(function(f){f.addEventListener('input',function(){var q=f.value.toLowerCase();
   document.querySelectorAll('#'+f.dataset.table+' tbody tr').forEach(function(r){r.style.display=r.textContent.toLowerCase().indexOf(q)>-1?'':'none'})})});
+window.binDiffSetUnchecked=function(list){unchecked=new Set(list||[]);apply(false)};
+apply(false);
+})();
 """
 
 
@@ -808,13 +867,15 @@ def _td(text, cls="", v=None) -> str:
                                  " data-v='%s'" % e(v) if v is not None else "", text)
 
 
-def _th(text, num=False) -> str:
-    return '<th%s>%s</th>' % (' class="num"' if num else "", e(text))
+def _th(text, num=False, cls="") -> str:
+    classes = " ".join(x for x in ("num" if num else "", cls) if x)
+    return '<th%s>%s</th>' % (' class="%s"' % classes if classes else "", e(text))
 
 
-def _table(head: List[str], rows: List[str], tid: str = "") -> str:
-    return ('<div class="wrap"><table %sclass="sortable"><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>'
-            % ('id="%s" ' % tid if tid else "", "".join(head), "".join(rows)))
+def _table(head: List[str], rows: List[str], tid: str = "", sortable: bool = True) -> str:
+    return ('<div class="wrap"><table %s%s><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>'
+            % ('id="%s" ' % tid if tid else "", 'class="sortable"' if sortable else "",
+               "".join(head), "".join(rows)))
 
 
 def _filter(tid: str, placeholder: str) -> str:
@@ -826,6 +887,10 @@ def _clip_name(p: Pair) -> str:
     if p.b.name != p.a.name:
         name += "<br><span class='muted'>B: %s</span>" % e(p.b.name)
     return name
+
+
+def col_key(name: str) -> str:
+    return name.strip().lower()
 
 
 def clip_table(clips: List[Clip], opts: ReportOptions) -> str:
@@ -849,7 +914,7 @@ def clip_table(clips: List[Clip], opts: ReportOptions) -> str:
     return _table(head, rows)
 
 
-def duration_table(flagged: List[Pair], opts: ReportOptions) -> str:
+def duration_table(flagged: List[Pair], opts: ReportOptions, pair_ids: Dict[int, int]) -> str:
     if not flagged:
         return '<div class="wrap"><div class="empty">No duration differences.</div></div>'
     max_abs = max(abs(p.diff) for p in flagged) or 1
@@ -887,11 +952,11 @@ def duration_table(flagged: List[Pair], opts: ReportOptions) -> str:
         if opts.on("magnitude"):
             r.append(_td("<div class='bar' style='width:%.1f%%'></div>" % max(2.0, 100.0 * abs(d) / max_abs),
                          "barcell", abs(d)))
-        rows.append("<tr>%s</tr>" % "".join(r))
+        rows.append("<tr data-pair='%d'>%s</tr>" % (pair_ids[id(p)], "".join(r)))
     return _filter("durations", "Filter by clip or tape name…") + _table(head, rows, "durations")
 
 
-def metadata_table(diffs: List[MetaDiff], opts: ReportOptions) -> str:
+def metadata_table(diffs: List[MetaDiff], opts: ReportOptions, pair_ids: Dict[int, int]) -> str:
     if not diffs:
         return '<div class="wrap"><div class="empty">No metadata differences in the compared columns.</div></div>'
     head = [_th("Clip")] + ([_th("Tape")] if opts.on("tape") else []) + [_th("Column"), _th("Bin A"), _th("Bin B")]
@@ -904,23 +969,46 @@ def metadata_table(diffs: List[MetaDiff], opts: ReportOptions) -> str:
         r.append(_td("<b>%s</b>" % e(d.column)))
         r.append(_td(e(d.a) if d.a else "<span class='muted'>(empty)</span>", "wrapcell va"))
         r.append(_td(e(d.b) if d.b else "<span class='muted'>(empty)</span>", "wrapcell vb"))
-        rows.append("<tr>%s</tr>" % "".join(r))
-    return _filter("metadata", "Filter by clip, tape, column or value…") + _table(head, rows, "metadata")
+        rows.append("<tr data-col='%s' data-pair='%d'>%s</tr>" % (e(col_key(d.column)), pair_ids[id(p)], "".join(r)))
+    return ('<div id="meta-table">' + _filter("metadata", "Filter by clip, tape, column or value…")
+            + _table(head, rows, "metadata") + '</div>'
+            + '<div id="meta-none" class="wrap empty colhidden">All columns with differences are hidden. '
+              'Tick them in “Differences by column” to show them.</div>')
+
+
+def sorted_counts(res: Result) -> List[Tuple[str, int]]:
+    """Columns by number of clips that differ, most first (ties keep bin column order)."""
+    counts = list(res.column_counts().items())
+    order = {c: i for i, (c, _) in enumerate(counts)}
+    return sorted(counts, key=lambda cn: (-cn[1], order[cn[0]]))
 
 
 def by_column_table(res: Result) -> str:
-    counts = res.column_counts()
+    counts = sorted_counts(res)
     if not counts:
         return '<div class="empty">No columns were compared.</div>'
-    top = max(counts.values()) or 1
-    rows = []
-    for col, n in counts.items():
-        cls = "" if n else "muted"
-        rows.append("<tr>%s%s%s</tr>" % (
-            _td(("<b>%s</b>" % e(col)) if n else e(col), cls),
-            _td(n, "num " + cls, n),
-            _td("<div class='bar' style='width:%.1f%%'></div>" % (100.0 * n / top) if n else "", "barcell", n)))
-    return _table([_th("Column"), _th("Clips that differ", True), _th("")], rows)
+    with_diffs = [(c, n) for c, n in counts if n]
+    zero = [c for c, n in counts if not n]
+    if not with_diffs:
+        out = '<div class="wrap"><div class="empty">No differences in any of the %d compared columns.</div></div>' % len(counts)
+    else:
+        top = with_diffs[0][1] or 1
+        rows = []
+        for col, n in with_diffs:
+            rows.append("<tr class='colrow' data-col='%s'>%s%s%s%s</tr>" % (
+                e(col_key(col)),
+                _td("<input type='checkbox' checked aria-label='Show %s'>" % e(col), "cb"),
+                _td("<b>%s</b>" % e(col)),
+                _td(n, "num", n),
+                _td("<div class='bar' style='width:%.1f%%'></div>" % (100.0 * n / top), "barcell", n)))
+        out = ('<div class="toolbar"><button data-act="all">Show all</button><button data-act="none">Hide all</button>'
+               '<span class="hint">Tick the columns you want to see — the report below updates to match.</span></div>'
+               + _table([_th("", cls="cb"), _th("Column"), _th("Clips that differ", True), _th("")], rows,
+                        "bycol", sortable=False))
+    if zero:
+        out += ('<details class="zero"><summary>%d compared column%s with no differences</summary>'
+                '<div style="margin-top:8px">%s</div></details>' % (len(zero), "" if len(zero) == 1 else "s", _chips(zero)))
+    return out
 
 
 def _chips(items: List[str]) -> str:
@@ -929,10 +1017,12 @@ def _chips(items: List[str]) -> str:
     return '<div class="chips">%s</div>' % "".join('<span class="chip">%s</span>' % e(i) for i in items)
 
 
-def write_html(res: Result, path: str, opts: ReportOptions = None):
+def write_html(res: Result, path: str, opts: ReportOptions = None, unchecked: Optional[Set[str]] = None):
     opts = opts or ReportOptions()
     flagged = res.flagged
-    meta = res.meta_diffs
+    pair_ids = {id(p): i for i, p in enumerate(res.pairs)}
+    rank = {col_key(c): i for i, (c, _) in enumerate(sorted_counts(res))}
+    meta = sorted(res.meta_diffs, key=lambda d: (rank.get(col_key(d.column), 999), d.pair.a.name.lower()))
     fps_set = sorted({c.fps for c in res.a.clips + res.b.clips})
 
     warnings = []
@@ -952,34 +1042,35 @@ def write_html(res: Result, path: str, opts: ReportOptions = None):
     parts.append('<div class="bins"><span>A</span><b>%s</b><span>B</span><b>%s</b></div>'
                  % (e(show_path(res.a)), e(show_path(res.b))))
 
+    def card(label, value, cls="", vid=None):
+        return '<div class="card %s"><div class="n"%s>%s</div><div class="l">%s</div></div>' % (
+            cls, ' id="%s"' % vid if vid else "", e(value), e(label))
+
     if opts.on("summary"):
         biggest = flagged[0] if flagged else None
-        cards = [
-            ("Clips in A", len(res.a.clips), ""), ("Clips in B", len(res.b.clips), ""),
-            ("Matched by tape", len(res.pairs), ""),
-            ("Clips with differences", len(res.changed), "hot" if res.changed else ""),
-        ]
+        cards = [card("Clips in A", len(res.a.clips)), card("Clips in B", len(res.b.clips)),
+                 card("Matched by tape", len(res.pairs)),
+                 card("Clips with differences", len(res.changed), "hot" if res.changed else "", "n-clips")]
         if res.compare_duration:
-            cards += [("Duration differences", len(flagged), "hot" if flagged else ""),
-                      ("Biggest duration difference", signed_tc(biggest.diff, biggest.a.fps) if biggest else "—",
-                       "hot" if biggest else "")]
-        cards += [("Metadata differences", len(meta), "hot" if meta else ""),
-                  ("Columns compared", len(res.compared_columns) + (1 if res.compare_duration else 0), ""),
-                  ("Only in A", len(res.only_a), ""), ("Only in B", len(res.only_b), "")]
+            cards += [card("Duration differences", len(flagged), "c-dur " + ("hot" if flagged else "")),
+                      card("Biggest duration difference", signed_tc(biggest.diff, biggest.a.fps) if biggest else "—",
+                           "c-dur " + ("hot" if biggest else ""))]
+        cards += [card("Metadata differences", len(meta), "hot" if meta else "", "n-meta"),
+                  card("Columns compared", len(res.compared_columns) + (1 if res.compare_duration else 0)),
+                  card("Only in A", len(res.only_a)), card("Only in B", len(res.only_b))]
         if res.no_tape_a or res.no_tape_b:
-            cards.append(("No tape name (A / B)", "%d / %d" % (len(res.no_tape_a), len(res.no_tape_b)), "hot"))
-        parts.append('<div class="cards">%s</div>' % "".join(
-            '<div class="card %s"><div class="n">%s</div><div class="l">%s</div></div>' % (c, e(n), e(l))
-            for l, n, c in cards))
+            cards.append(card("No tape name (A / B)", "%d / %d" % (len(res.no_tape_a), len(res.no_tape_b)), "hot"))
+        parts.append('<div class="cards">%s</div>' % "".join(cards))
     parts.append(warn_html)
 
     if opts.on("by_column"):
         parts.append("<h2>Differences by column</h2>%s" % by_column_table(res))
     if opts.on("durations") and res.compare_duration:
-        parts.append("<h2>Duration differences, ranked largest first (%d)</h2>%s"
-                     % (len(flagged), duration_table(flagged, opts)))
+        parts.append('<section id="sec-durations"><h2>Duration differences, ranked largest first (%d)</h2>%s</section>'
+                     % (len(flagged), duration_table(flagged, opts, pair_ids)))
     if opts.on("metadata"):
-        parts.append("<h2>Metadata differences (%d)</h2>%s" % (len(meta), metadata_table(meta, opts)))
+        parts.append('<h2>Metadata differences (<span id="h-meta">%d</span>)</h2>%s'
+                     % (len(meta), metadata_table(meta, opts, pair_ids)))
     if opts.on("columns"):
         parts.append("<h2>Columns not compared</h2>"
                      "<p class='muted'>Only in bin A:</p>%s<p class='muted'>Only in bin B:</p>%s"
@@ -1011,13 +1102,14 @@ def write_html(res: Result, path: str, opts: ReportOptions = None):
         notes.append("Duration differences of %d frame(s) or less are ignored." % res.tolerance)
     doc = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>%s report</title><style>%s</style></head>
-<body><main>
+<body data-unchecked='%s'><main>
 <h1>Bin comparison report</h1>
 <p class="sub">Clips are linked by tape name; every other shared column is compared. Generated %s. %s</p>
 %s
 <footer>%s · by Alex Stuart</footer>
 </main><script>%s</script></body></html>""" % (
-        APP_NAME, CSS, e(_dt.datetime.now().strftime("%Y-%m-%d %H:%M")), e(" ".join(notes)),
+        APP_NAME, CSS, e(json.dumps(sorted(col_key(c) for c in (unchecked or set())))),
+        e(_dt.datetime.now().strftime("%Y-%m-%d %H:%M")), e(" ".join(notes)),
         "\n".join(parts), APP_NAME, JS)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(doc)
@@ -1071,6 +1163,7 @@ def main(argv=None):
     ap.add_argument("--hide", metavar="KEYS", help="Comma-separated report parts to leave out. Sections: %s. "
                     "Duration table columns: %s." % (", ".join(SECTIONS), ", ".join(COLUMNS)))
     ap.add_argument("--show", metavar="KEYS", help="Comma-separated extra duration-table columns: %s." % ", ".join(EXTRAS))
+    ap.add_argument("--unchecked", metavar="NAMES", help="Comma-separated columns to start unticked (hidden) in the report's column list")
     ap.add_argument("--open", action="store_true", help="Open the report in your browser when done")
     ap.add_argument("--json", action="store_true", help=argparse.SUPPRESS)  # used by the Mac app
     args = ap.parse_args(argv)
@@ -1086,7 +1179,7 @@ def main(argv=None):
         out = os.path.join(os.path.dirname(os.path.abspath(args.bin_a)),
                            "%s_vs_%s_bindiff.html" % (stem(args.bin_a), stem(args.bin_b)))
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-    write_html(res, out, opts)
+    write_html(res, out, opts, split_list(args.unchecked))
     csv_path = None
     if not args.no_csv:
         csv_path = os.path.splitext(out)[0] + ".csv"
@@ -1106,6 +1199,7 @@ def main(argv=None):
             "columns": all_cols,
             "columns_only_a": res.columns_only_a, "columns_only_b": res.columns_only_b,
             "report": os.path.abspath(out), "csv": csv_path and os.path.abspath(csv_path),
+            "bin_a": a.label, "bin_b": b.label,
         }))
     else:
         print_summary(res)

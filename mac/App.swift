@@ -56,6 +56,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        DispatchQueue.global(qos: .background).async { Prefs.tidyWorkFolder() }
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
             Updater.shared.checkAutomaticallyIfDue()
         }

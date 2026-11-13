@@ -18,6 +18,26 @@ enum Prefs {
     static let ignoredColumns = "ignoredColumns"        // [String]
     static let knownColumns = "knownColumns"            // [String]
     static let ignoreValueCase = "ignoreValueCase"
+    static let autoSave = "autoSaveReports"                // 2.1: reports open in the app; saving is optional
+    static let alsoOpenInBrowser = "alsoOpenInBrowser"
+    static let reportUnchecked = "reportUncheckedColumns"  // [String], columns unticked in the report
+
+    /// Where reports live while they're open in the app (when auto-save is off).
+    static var workFolderURL: URL {
+        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        return caches.appendingPathComponent("Bin Diff/Reports", isDirectory: true)
+    }
+
+    /// Delete work-folder reports older than a few days.
+    static func tidyWorkFolder() {
+        let fm = FileManager.default
+        let cutoff = Date().addingTimeInterval(-3 * 24 * 3600)
+        let items = (try? fm.contentsOfDirectory(at: workFolderURL, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+        for u in items {
+            let d = (try? u.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date()
+            if d < cutoff { try? fm.removeItem(at: u) }
+        }
+    }
 
     /// ~/Documents/Bin Diff Reports -- or the 1.x folder if reports already go there.
     static var defaultReportsFolder: URL {
@@ -101,7 +121,7 @@ enum ReportParts {
     static let sections: [(String, String)] = [
         ("paths", "Full bin file paths"),
         ("summary", "Summary boxes at the top"),
-        ("by_column", "Differences by column overview"),
+        ("by_column", "Differences by column (with show/hide ticks)"),
         ("durations", "Duration differences, ranked"),
         ("metadata", "Metadata differences"),
         ("columns", "Columns that weren't compared"),
@@ -157,7 +177,8 @@ struct SettingsView: View {
 
 struct GeneralSettings: View {
     @AppStorage(Prefs.reportsFolder) private var folder = ""
-    @AppStorage(Prefs.openReport) private var openReport = true
+    @AppStorage(Prefs.autoSave) private var autoSave = false
+    @AppStorage(Prefs.alsoOpenInBrowser) private var alsoOpenInBrowser = false
     @AppStorage(Prefs.writeCSV) private var writeCSV = true
     @AppStorage(Prefs.tolerance) private var tolerance = 0
     @AppStorage(Prefs.caseSensitive) private var caseSensitive = false
@@ -167,7 +188,9 @@ struct GeneralSettings: View {
         VStack(alignment: .leading, spacing: 14) {
             GroupBox(label: Text("Reports").bold()) {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Save reports in:")
+                    Text("Reports open in Bin Diff. Use Export PDF… in the report to save one.")
+                        .foregroundColor(.secondary)
+                    Text("Save and export reports in:")
                     HStack {
                         Image(systemName: "folder")
                         Text(displayPath).lineLimit(1).truncationMode(.middle)
@@ -176,8 +199,10 @@ struct GeneralSettings: View {
                         Button("Choose…", action: chooseFolder)
                         Button("Default") { folder = "" }.disabled(folder.isEmpty)
                     }
-                    Toggle("Open the report in my browser after comparing", isOn: $openReport)
-                    Toggle("Also save a CSV spreadsheet next to each report", isOn: $writeCSV)
+                    Toggle("Also save every report automatically (HTML)", isOn: $autoSave)
+                    Toggle("Include a CSV spreadsheet with each saved report", isOn: $writeCSV)
+                        .disabled(!autoSave).padding(.leading, 20)
+                    Toggle("Also open each report in my web browser", isOn: $alsoOpenInBrowser)
                 }
                 .padding(6)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -313,7 +338,7 @@ struct ReportSettings: View {
             }
             Spacer(minLength: 0)
             HStack {
-                Text("Which metadata columns are compared is set on the Columns tab. Changes apply to the next comparison.")
+                Text("Which columns are compared is set on the Columns tab; which ones you see is ticked in the report itself. Changes apply to the next comparison.")
                     .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
                 Spacer()
                 Button("Restore Defaults") { ReportParts.resetAll(); resetToken = UUID() }

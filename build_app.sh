@@ -12,7 +12,7 @@ cd "$(dirname "$0")"
 ROOT="$PWD"
 
 APP="Bin Diff"
-VERSION="${VERSION:-2.0.0}"   # override: VERSION=1.3.0 ./build_app.sh
+VERSION="${VERSION:-2.1.0}"   # override: VERSION=1.3.0 ./build_app.sh
 PY=/usr/bin/python3            # Apple's universal2 Python, needed for a universal engine
 VENV=build/venv
 
@@ -29,7 +29,7 @@ VENV=build/venv
 # 2. Window: compile the Swift front end for both architectures and merge
 [ -f mac/AppIcon.icns ] || xcrun swift mac/make_icon.swift mac
 SDK="$(xcrun --show-sdk-path)"
-SOURCES=(mac/App.swift mac/MainWindow.swift mac/Engine.swift mac/Settings.swift mac/Updater.swift mac/BugReport.swift)
+SOURCES=(mac/App.swift mac/MainWindow.swift mac/Engine.swift mac/Settings.swift mac/Updater.swift mac/BugReport.swift mac/ReportWindow.swift)
 mkdir -p build/swift
 for arch in arm64 x86_64; do
   xcrun swiftc -O -parse-as-library -target "$arch-apple-macos11.0" -sdk "$SDK" \

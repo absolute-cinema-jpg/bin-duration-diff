@@ -9,7 +9,9 @@ Compare two Avid bins and see every difference. Clips are linked by their **Tape
 1. Download **Bin-Diff.zip** from the [latest release](https://github.com/absolute-cinema-jpg/bin-diff/releases/latest) and unzip it.
 2. Drag **Bin Diff** into your Applications folder.
 3. First launch only: double-click it, click **Done** on the warning, then go to **System Settings → Privacy & Security** and click **Open Anyway**. (On macOS 13/14 you can right-click the app → **Open** instead.)
-4. Choose or drag in **Bin A** and **Bin B**, then click **Compare**. The report opens in your browser and is saved to `Documents/Bin Diff Reports` (changeable in Settings).
+4. Choose or drag in **Bin A** and **Bin B**, then click **Compare**. The report opens in its own window.
+5. Under **Differences by column** (sorted by how many clips differ), tick the columns you want to see — Duration, Start, End, Scene… The report updates as you go, and Bin Diff remembers your choice.
+6. **Export PDF…** saves exactly what you're looking at. **More** has Print, Export HTML, Export CSV and Open in Browser.
 
 The app checks for updates once a day and can install them itself. **Report a Bug…** opens a pre-filled GitHub issue. Settings are kept when you quit or update.
 
@@ -19,7 +21,7 @@ Runs on Intel and Apple Silicon Macs, macOS 11 or later. Python and everything e
 
 - **Columns** — which columns are compared. Columns from bins you compare are added automatically; untick any you don't care about (Modified Date is off by default). Optionally ignore upper/lower case differences in values.
 - **Report** — which sections appear (summary, differences by column, ranked durations, metadata differences, columns not compared, only in A/B, no tape name, identical clips) and the duration table's columns.
-- **General** — where reports are saved, open automatically, CSV on/off, ignore duration differences of up to N frames, case-sensitive tape names, include subclips.
+- **General** — the folder for PDFs and saved reports, optionally save every report automatically (with a CSV), also open in the browser, ignore duration differences of up to N frames, case-sensitive tape names, include subclips.
 
 ## Inputs
 

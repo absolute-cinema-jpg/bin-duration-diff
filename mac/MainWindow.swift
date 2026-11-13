@@ -11,7 +11,8 @@ struct ContentView: View {
     @State private var binA: URL?
     @State private var binB: URL?
     @AppStorage("textFPS") private var fps = "24"
-    @AppStorage(Prefs.openReport) private var openReport = true
+    @AppStorage(Prefs.alsoOpenInBrowser) private var alsoOpenInBrowser = false
+    @State private var savedCopy = false
     @State private var running = false
     @State private var summary: Summary?
     @State private var errorText: String?
@@ -54,7 +55,7 @@ struct ContentView: View {
                 .frame(maxWidth: 360)
             }
 
-            if let s = summary { ResultBox(summary: s) }
+            if let s = summary { ResultBox(summary: s, savedCopy: savedCopy) }
             if let e = errorText {
                 HStack(alignment: .firstTextBaseline) {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.red)
@@ -97,7 +98,8 @@ struct ContentView: View {
         }
         running = true; errorText = nil; summary = nil
         let options = engineOptions(fps: fps)
-        let open = openReport
+        let browser = alsoOpenInBrowser
+        let saving = Prefs.bool(Prefs.autoSave, false)
         DispatchQueue.global(qos: .userInitiated).async {
             let result = Result { try runEngine(binA: a, binB: b, options: options) }
             DispatchQueue.main.async {
@@ -105,9 +107,11 @@ struct ContentView: View {
                 switch result {
                 case .success(let s):
                     summary = s
+                    savedCopy = saving
                     AppState.shared.lastError = nil
                     ColumnPrefs.shared.remember(s.columns ?? [])
-                    if open { NSWorkspace.shared.open(URL(fileURLWithPath: s.report)) }
+                    ReportController.open(s)
+                    if browser { NSWorkspace.shared.open(URL(fileURLWithPath: s.report)) }
                 case .failure(let err):
                     errorText = err.localizedDescription
                     AppState.shared.lastError = err.localizedDescription
@@ -119,6 +123,7 @@ struct ContentView: View {
 
 struct ResultBox: View {
     let summary: Summary
+    var savedCopy = false
 
     var headline: String {
         let n = summary.clips_with_differences ?? summary.differences
@@ -143,9 +148,11 @@ struct ResultBox: View {
                 }
                 Spacer()
                 VStack(alignment: .trailing, spacing: 6) {
-                    Button("Open Report") { NSWorkspace.shared.open(URL(fileURLWithPath: summary.report)) }
-                    Button("Show in Finder") {
-                        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: summary.report)])
+                    Button("Show Report") { ReportController.open(summary) }
+                    if savedCopy {
+                        Button("Show in Finder") {
+                            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: summary.report)])
+                        }
                     }
                 }
             }
