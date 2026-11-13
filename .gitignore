@@ -1,0 +1,9 @@
+build/
+dist/
+__pycache__/
+*.pyc
+.DS_Store
+.claude/
+# reports written next to bins when testing the CLI
+*_durations.html
+*_durations.csv

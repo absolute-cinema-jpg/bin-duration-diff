@@ -1,0 +1,882 @@
+#!/usr/bin/env python3
+"""
+bin_diff.py - compare clip durations between two Avid bins.
+
+Clips are matched by TAPE NAME. Every matched pair whose durations differ is
+flagged, and the differences are ranked biggest-first in an HTML report
+(plus a CSV with the same rows).
+
+Accepted inputs (each side can be any of these):
+  * .avb   Avid bin, read directly (pyavb is bundled in ./vendor)
+  * .ale   Avid Log Exchange export
+  * .txt / .tab / .tsv / .csv   Bin export (File > Export > Tab Delimited).
+           Needs a Tape column and a Duration column (or Start + End).
+
+Usage:
+  python3 bin_diff.py BIN_A BIN_B [-o report.html] [--fps 23.976]
+                      [--tolerance 0] [--include-subclips] [--open]
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as _dt
+import html
+import json
+import os
+import re
+import sys
+import webbrowser
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set, Tuple
+
+# Use the bundled copy of pyavb (vendor/avb) so nothing needs to be pip-installed.
+_HERE = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+_VENDOR = os.path.join(_HERE, "vendor")
+if os.path.isdir(_VENDOR) and _VENDOR not in sys.path:
+    sys.path.insert(0, _VENDOR)
+
+
+# --------------------------------------------------------------------------- #
+# Timecode helpers
+# --------------------------------------------------------------------------- #
+
+def nominal_fps(fps: float) -> int:
+    return int(round(fps))
+
+
+def is_drop_rate(fps: float) -> bool:
+    return abs(fps - 29.97) < 0.01 or abs(fps - 59.94) < 0.01
+
+
+def tc_to_frames(tc: str, fps: float) -> Optional[int]:
+    """Parse timecode ('01:00:10:12', drop-frame ';'), feet+frames ('12+05')
+    or a plain frame count. Returns None if it can't be parsed."""
+    if tc is None:
+        return None
+    tc = tc.strip()
+    if not tc:
+        return None
+    if re.fullmatch(r"-?\d+", tc):
+        return int(tc)
+    m = re.fullmatch(r"(\d+)\+(\d+)", tc)  # 35mm 4-perf feet+frames
+    if m:
+        return int(m.group(1)) * 16 + int(m.group(2))
+    m = re.fullmatch(r"(\d+)[:;.](\d+)[:;.](\d+)([:;.,])(\d+)", tc)
+    if not m:
+        return None
+    h, mi, s, sep, f = int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4), int(m.group(5))
+    base = nominal_fps(fps)
+    frames = (h * 3600 + mi * 60 + s) * base + f
+    if (sep in ";," or ";" in tc) and base in (30, 60):
+        drop = 2 if base == 30 else 4
+        total_min = h * 60 + mi
+        frames -= drop * (total_min - total_min // 10)
+    return frames
+
+
+def frames_to_tc(frames: int, fps: float) -> str:
+    """Duration-style timecode (non-drop at nominal rate), with sign."""
+    sign = "-" if frames < 0 else ""
+    frames = abs(int(frames))
+    base = nominal_fps(fps) or 24
+    f = frames % base
+    s = frames // base
+    return "%s%02d:%02d:%02d:%02d" % (sign, s // 3600, (s // 60) % 60, s % 60, f)
+
+
+def frames_to_clock_tc(frames: int, base: int, drop: bool = False) -> str:
+    """Frame count -> wall-clock timecode (e.g. a start TC), drop-frame aware."""
+    frames = max(0, int(frames))
+    if drop and base in (30, 60):
+        d = 2 if base == 30 else 4
+        per_min = base * 60 - d
+        per_10 = per_min * 10 + d
+        tens, rem = divmod(frames, per_10)
+        frames += d * 9 * tens + (d * ((rem - d) // per_min) if rem > d else 0)
+    f = frames % base
+    s = frames // base
+    sep = ";" if drop and base in (30, 60) else ":"
+    return "%02d:%02d:%02d%s%02d" % ((s // 3600) % 24, (s // 60) % 60, s % 60, sep, f)
+
+
+def fmt_fps(fps: float) -> str:
+    return ("%.3f" % fps).rstrip("0").rstrip(".")
+
+
+# --------------------------------------------------------------------------- #
+# Clip model
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class Clip:
+    name: str
+    tape: str
+    frames: Optional[int]          # duration in frames (None = unknown)
+    fps: float
+    kind: str = "clip"             # master / subclip / clip
+    raw_duration: str = ""
+    start_tc: str = ""             # source start timecode, when known
+
+
+@dataclass
+class Bin:
+    path: str
+    clips: List[Clip] = field(default_factory=list)
+
+    @property
+    def label(self) -> str:
+        return os.path.basename(self.path)
+
+
+# --------------------------------------------------------------------------- #
+# Readers
+# --------------------------------------------------------------------------- #
+
+TAPE_COLS = ["tape", "tape name", "tapename", "source tape", "tape id"]
+NAME_COLS = ["name", "clip name", "clipname"]
+DUR_COLS = ["duration", "dur", "length"]
+START_COLS = ["start", "start tc", "start timecode"]
+END_COLS = ["end", "end tc", "end timecode"]
+FPS_COLS = ["fps", "frame rate", "project rate"]
+
+
+def _find_col(header: List[str], candidates: List[str], override: Optional[str] = None) -> Optional[int]:
+    norm = [h.strip().lower() for h in header]
+    if override:
+        o = override.strip().lower()
+        return norm.index(o) if o in norm else None
+    for c in candidates:
+        if c in norm:
+            return norm.index(c)
+    return None
+
+
+def _read_text(path: str) -> str:
+    raw = open(path, "rb").read()
+    for enc in ("utf-8-sig", "utf-16", "mac_roman"):
+        try:
+            text = raw.decode(enc)
+            if enc == "utf-16" and not raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+                continue
+            return text
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("latin-1")
+
+
+def parse_fps(value: str) -> Optional[float]:
+    try:
+        v = float(str(value).strip().split()[0])
+        return v if v > 0 else None
+    except (ValueError, IndexError):
+        return None
+
+
+def rows_to_bin(path: str, header: List[str], rows: List[List[str]], fps: float, args) -> Bin:
+    b = Bin(path)
+    i_tape = _find_col(header, TAPE_COLS, args.tape_column)
+    i_name = _find_col(header, NAME_COLS)
+    i_dur = _find_col(header, DUR_COLS, args.duration_column)
+    i_start = _find_col(header, START_COLS)
+    i_end = _find_col(header, END_COLS)
+    i_fps = _find_col(header, FPS_COLS)
+
+    if i_tape is None:
+        raise SystemExit("%s: no Tape column found. Columns are: %s\n"
+                         "Add the Tape column to the bin view before exporting, "
+                         "or pass --tape-column." % (path, ", ".join(header)))
+    if i_dur is None and (i_start is None or i_end is None):
+        raise SystemExit("%s: no Duration column (or Start + End) found. Columns are: %s"
+                         % (path, ", ".join(header)))
+
+    def cell(row, i):
+        return row[i].strip() if i is not None and i < len(row) else ""
+
+    for row in rows:
+        if not any(c.strip() for c in row):
+            continue
+        row_fps = parse_fps(cell(row, i_fps)) or fps
+        raw = cell(row, i_dur)
+        frames = tc_to_frames(raw, row_fps) if raw else None
+        if frames is None and i_start is not None and i_end is not None:
+            s, e = tc_to_frames(cell(row, i_start), row_fps), tc_to_frames(cell(row, i_end), row_fps)
+            if s is not None and e is not None:
+                frames = e - s
+                raw = raw or "%s - %s" % (cell(row, i_start), cell(row, i_end))
+        b.clips.append(Clip(name=cell(row, i_name) or "(unnamed)", tape=cell(row, i_tape),
+                            frames=frames, fps=row_fps, raw_duration=raw, start_tc=cell(row, i_start)))
+    return b
+
+
+def read_delimited(path: str, args) -> Bin:
+    text = _read_text(path)
+    lines = text.splitlines()
+    sample = "\n".join(lines[:5])
+    delim = "\t" if "\t" in sample else ","
+    rows = list(csv.reader(lines, delimiter=delim))
+    rows = [r for r in rows if any(c.strip() for c in r)]
+    if not rows:
+        raise SystemExit("%s: file is empty" % path)
+    return rows_to_bin(path, rows[0], rows[1:], args.fps, args)
+
+
+def read_ale(path: str, args) -> Bin:
+    lines = _read_text(path).splitlines()
+    section, header, rows, fps = None, None, [], None
+    for line in lines:
+        key = line.strip().lower()
+        if key in ("heading", "column", "data"):
+            section = key
+            continue
+        if not line.strip():
+            continue
+        if section == "heading":
+            parts = line.split("\t")
+            if parts[0].strip().lower() == "fps" and len(parts) > 1:
+                fps = parse_fps(parts[1])
+        elif section == "column" and header is None:
+            header = line.split("\t")
+        elif section == "data":
+            rows.append(line.split("\t"))
+    if header is None:
+        raise SystemExit("%s: doesn't look like an ALE (no Column section)" % path)
+    return rows_to_bin(path, header, rows, fps or args.fps, args)
+
+
+def read_avb(path: str, args) -> Bin:
+    try:
+        import avb  # type: ignore
+    except ImportError:
+        raise SystemExit("Couldn't load the bundled pyavb library (vendor/avb is missing).\n"
+                         "Export the bin from Avid as Tab Delimited / ALE and use that instead.")
+
+    b = Bin(path)
+
+    def comp_rate(comp) -> Optional[float]:
+        r = getattr(comp, "edit_rate", None)
+        try:
+            return float(r) if r else None
+        except (TypeError, ValueError):
+            return None
+
+    def ordered_tracks(mob):
+        tracks = list(getattr(mob, "tracks", []) or [])
+        def key(t):
+            try:
+                mk = t.component.media_kind
+            except Exception:
+                mk = None
+            return {"picture": 0, "sound": 1}.get(mk, 2)
+        return sorted(tracks, key=key)
+
+    def walk_clips(comp, depth=0):
+        """Yield SourceClips found inside a component tree."""
+        if comp is None or depth > 12:
+            return
+        if type(comp).__name__ == "SourceClip":
+            yield comp
+            return
+        for attr in ("components", "tracks", "input_segment"):
+            child = getattr(comp, attr, None)
+            if child is None:
+                continue
+            for c in (child if isinstance(child, (list, tuple)) or hasattr(child, "__iter__") else [child]):
+                yield from walk_clips(getattr(c, "component", c), depth + 1)
+
+    def timecode_of(tape_mob):
+        for t in getattr(tape_mob, "tracks", []) or []:
+            comp = getattr(t, "component", None)
+            for c in [comp] + list(getattr(comp, "components", []) or []):
+                if type(c).__name__ == "Timecode":
+                    return c
+        return None
+
+    def find_source(mob, offset=0, depth=0, seen=None) -> Tuple[Optional[str], str]:
+        """Follow a clip back to its tape. Returns (tape name, start timecode)."""
+        seen = seen if seen is not None else set()
+        if mob is None or depth > 8 or id(mob) in seen:
+            return None, ""
+        seen.add(id(mob))
+        desc = getattr(mob, "descriptor", None)
+        if desc is not None and type(desc).__name__ == "TapeDescriptor":
+            start = ""
+            tc = timecode_of(mob)
+            try:
+                if tc is not None and int(tc.fps or 0) > 0:
+                    start = frames_to_clock_tc(int(tc.start or 0) + offset, int(tc.fps),
+                                               bool(int(tc.flags or 0) & 1))
+            except Exception:
+                start = ""
+            return mob.name, start
+        for t in ordered_tracks(mob):
+            for sc in walk_clips(t.component):
+                try:
+                    ref = sc.mob
+                    sc_start = int(getattr(sc, "start_time", 0) or 0)
+                except Exception:
+                    ref, sc_start = None, 0
+                tape, start = find_source(ref, offset + sc_start, depth + 1, seen)
+                if tape:
+                    return tape, start
+        return None, ""
+
+    def mob_rate(mob) -> Optional[float]:
+        for t in ordered_tracks(mob):
+            try:
+                if t.component.media_kind == "timecode":
+                    continue
+            except Exception:
+                pass
+            r = comp_rate(getattr(t, "component", None))
+            if r:
+                return r
+        return None
+
+    with avb.open(path) as f:
+        items = list(f.content.items)
+        # Bins also carry hidden "reference clips" (e.g. the master clips behind
+        # a subclip). Those aren't user_placed; skip them like Avid's bin view does.
+        visible = [it for it in items if getattr(it, "user_placed", True)]
+
+        def is_clip(it):
+            try:
+                return it.mob.mob_type == "MasterMob" or (
+                    it.mob.mob_type == "CompositionMob" and getattr(it.mob, "usage_code", None) == 2)
+            except Exception:
+                return False
+        if not any(is_clip(it) for it in visible):
+            visible = items
+        for item in visible:
+            mob = item.mob
+            try:
+                mtype = mob.mob_type
+            except Exception:
+                continue
+            if mtype == "MasterMob":
+                kind = "master"
+            elif mtype == "CompositionMob" and getattr(mob, "usage_code", None) == 2:
+                kind = "subclip"
+            else:
+                continue
+            rate = mob_rate(mob) or args.fps
+            try:
+                length = int(mob.length)
+            except Exception:
+                length = None
+            tape, start = find_source(mob)
+            b.clips.append(Clip(name=mob.name or "(unnamed)", tape=tape or "", frames=length,
+                                fps=rate, kind=kind, start_tc=start,
+                                raw_duration=frames_to_tc(length, rate) if length is not None else ""))
+    return b
+
+
+def select_clip_kinds(b: Bin, include_subclips: bool) -> Bin:
+    """Master clips only, unless subclips are requested -- or the bin has no
+    master clips at all (e.g. an AutoSync bin full of sync subclips)."""
+    masters = [c for c in b.clips if c.kind != "subclip"]
+    subs = [c for c in b.clips if c.kind == "subclip"]
+    if not subs or include_subclips:
+        return b
+    if not masters:
+        return b
+    b.clips = masters
+    return b
+
+
+def bin_kind_counts(b: Bin) -> Tuple[int, int]:
+    subs = sum(1 for c in b.clips if c.kind == "subclip")
+    return len(b.clips) - subs, subs
+
+
+def load_bin(path: str, args, filter_kinds: bool = True) -> Bin:
+    if not os.path.isfile(path):
+        raise SystemExit("File not found: %s" % path)
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".avb":
+        b = read_avb(path, args)
+        return select_clip_kinds(b, args.include_subclips) if filter_kinds else b
+    if ext == ".ale":
+        return read_ale(path, args)
+    head = _read_text(path)[:200].lower()
+    if head.lstrip().startswith("heading"):
+        return read_ale(path, args)
+    return read_delimited(path, args)
+
+
+# --------------------------------------------------------------------------- #
+# Comparison
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class Pair:
+    tape: str
+    a: Clip
+    b: Clip
+    note: str = ""
+
+    @property
+    def diff(self) -> Optional[int]:
+        if self.a.frames is None or self.b.frames is None:
+            return None
+        return self.b.frames - self.a.frames
+
+    @property
+    def abs_seconds(self) -> float:
+        d = self.diff or 0
+        return abs(d) / (self.a.fps or 24)
+
+
+@dataclass
+class Result:
+    a: Bin
+    b: Bin
+    pairs: List[Pair]
+    only_a: List[Clip]
+    only_b: List[Clip]
+    no_tape_a: List[Clip]
+    no_tape_b: List[Clip]
+    dup_tapes: Dict[str, Tuple[int, int]]
+    tolerance: int
+
+    @property
+    def flagged(self) -> List[Pair]:
+        out = [p for p in self.pairs if p.diff is not None and abs(p.diff) > self.tolerance]
+        return sorted(out, key=lambda p: (-abs(p.diff), p.tape.lower()))
+
+    @property
+    def unknown(self) -> List[Pair]:
+        return [p for p in self.pairs if p.diff is None]
+
+    @property
+    def matching(self) -> List[Pair]:
+        return [p for p in self.pairs if p.diff is not None and abs(p.diff) <= self.tolerance]
+
+
+def tape_key(tape: str, case_sensitive: bool) -> str:
+    t = tape.strip()
+    return t if case_sensitive else t.lower()
+
+
+def group(clips: List[Clip], case_sensitive: bool):
+    groups: "OrderedDict[str, List[Clip]]" = OrderedDict()
+    no_tape = []
+    for c in clips:
+        if not c.tape.strip():
+            no_tape.append(c)
+            continue
+        groups.setdefault(tape_key(c.tape, case_sensitive), []).append(c)
+    return groups, no_tape
+
+
+def compare(a: Bin, b: Bin, tolerance: int, case_sensitive: bool) -> Result:
+    ga, nta = group(a.clips, case_sensitive)
+    gb, ntb = group(b.clips, case_sensitive)
+    pairs, only_a, only_b, dups = [], [], [], {}
+
+    for key in list(ga.keys()) + [k for k in gb.keys() if k not in ga]:
+        la, lb = list(ga.get(key, [])), list(gb.get(key, []))
+        if len(la) > 1 or len(lb) > 1:
+            dups[key] = (len(la), len(lb))
+        note = "tape appears %d× in A, %d× in B" % (len(la), len(lb)) if key in dups else ""
+        # Same tape used by several clips: pair identical clip names first, then the rest in order.
+        for ca in list(la):
+            match = next((cb for cb in lb if cb.name == ca.name), None)
+            if match is not None and (len(la) > 1 or len(lb) > 1):
+                pairs.append(Pair(ca.tape, ca, match, note))
+                la.remove(ca)
+                lb.remove(match)
+        for ca, cb in zip(la, lb):
+            pairs.append(Pair(ca.tape, ca, cb, note))
+        only_a.extend(la[len(lb):])
+        only_b.extend(lb[len(la):])
+
+    return Result(a, b, pairs, only_a, only_b, nta, ntb, dups, tolerance)
+
+
+# --------------------------------------------------------------------------- #
+# Report options
+# --------------------------------------------------------------------------- #
+
+# Shown by default (turn off with --hide): sections, then ranked-table columns.
+SECTIONS = ["paths", "summary", "only_a", "only_b", "no_tape", "same"]
+COLUMNS = ["tape", "dur_a", "dur_b", "diff_tc", "diff_frames", "diff_sec", "direction", "magnitude"]
+# Off by default (turn on with --show).
+EXTRAS = ["start_tc", "frames", "fps"]
+REPORT_KEYS = SECTIONS + COLUMNS + EXTRAS
+
+
+@dataclass
+class ReportOptions:
+    hide: Set[str] = field(default_factory=set)
+    show: Set[str] = field(default_factory=set)
+
+    def on(self, key: str) -> bool:
+        return key in self.show if key in EXTRAS else key not in self.hide
+
+
+def parse_keys(s: Optional[str]) -> Set[str]:
+    keys = {k.strip() for k in (s or "").split(",") if k.strip()}
+    bad = keys - set(REPORT_KEYS)
+    if bad:
+        raise SystemExit("Unknown report option(s): %s\nValid options: %s"
+                         % (", ".join(sorted(bad)), ", ".join(REPORT_KEYS)))
+    return keys
+
+
+def signed_tc(d: int, fps: float) -> str:
+    return ("+" if d > 0 else "") + frames_to_tc(d, fps)
+
+
+def dur_tc(c: Clip) -> str:
+    return frames_to_tc(c.frames, c.fps) if c.frames is not None else (c.raw_duration or "")
+
+
+# --------------------------------------------------------------------------- #
+# Output
+# --------------------------------------------------------------------------- #
+
+def _csv_headers(opts: ReportOptions) -> List[str]:
+    h = ["Rank", "Clip (A)", "Clip (B)"]
+    if opts.on("tape"): h.append("Tape")
+    if opts.on("dur_a"): h.append("Duration A")
+    if opts.on("dur_b"): h.append("Duration B")
+    if opts.on("start_tc"): h += ["Start A", "Start B"]
+    if opts.on("frames"): h += ["Frames A", "Frames B"]
+    if opts.on("fps"): h.append("FPS")
+    if opts.on("diff_tc"): h.append("Diff (TC)")
+    if opts.on("diff_frames"): h.append("Diff (frames)")
+    if opts.on("diff_sec"): h.append("Diff (sec)")
+    return h + ["Status", "Note"]
+
+
+def _pair_values(p: "Pair", rank) -> dict:
+    d = p.diff
+    v = {"Rank": rank, "Clip (A)": p.a.name, "Clip (B)": p.b.name, "Tape": p.tape,
+         "Duration A": dur_tc(p.a), "Duration B": dur_tc(p.b),
+         "Start A": p.a.start_tc, "Start B": p.b.start_tc,
+         "Frames A": p.a.frames, "Frames B": p.b.frames, "FPS": fmt_fps(p.a.fps), "Note": p.note}
+    if d is not None:
+        v.update({"Diff (TC)": signed_tc(d, p.a.fps), "Diff (frames)": d,
+                  "Diff (sec)": "%.3f" % (d / (p.a.fps or 24)),
+                  "Status": "same duration" if d == 0 else ("B longer" if d > 0 else "B shorter")})
+    return v
+
+
+def _clip_values(c: Clip, side: str, status: str) -> dict:
+    return {"Clip (%s)" % side: c.name, "Tape": c.tape, "Duration %s" % side: dur_tc(c),
+            "Start %s" % side: c.start_tc, "Frames %s" % side: c.frames, "FPS": fmt_fps(c.fps),
+            "Status": status}
+
+
+def write_csv(res: Result, path: str, opts: ReportOptions = None):
+    opts = opts or ReportOptions()
+    headers = _csv_headers(opts)
+    rows = [_pair_values(p, i) for i, p in enumerate(res.flagged, 1)]
+    if opts.on("only_a"): rows += [_clip_values(c, "A", "only in A") for c in res.only_a]
+    if opts.on("only_b"): rows += [_clip_values(c, "B", "only in B") for c in res.only_b]
+    if opts.on("no_tape"):
+        rows += [_clip_values(c, "A", "no tape name") for c in res.no_tape_a]
+        rows += [_clip_values(c, "B", "no tape name") for c in res.no_tape_b]
+    if opts.on("same"): rows += [_pair_values(p, "") for p in res.matching]
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(headers)
+        for r in rows:
+            w.writerow(["" if r.get(h) is None else r.get(h, "") for h in headers])
+
+
+CSS = """
+:root{--bg:#f6f6f4;--panel:#fff;--ink:#1d1d1f;--muted:#6b6b70;--line:#e3e3df;
+--accent:#2f5bd3;--long:#b4541a;--short:#2a7a5a;--bar:#dfe6fb;--warn:#8a6a00;--warnbg:#fff6d9}
+@media (prefers-color-scheme:dark){:root{--bg:#141416;--panel:#1d1d20;--ink:#ececee;--muted:#9a9aa2;
+--line:#2e2e33;--accent:#7d9bff;--long:#f0965a;--short:#5fcf9f;--bar:#2a3352;--warn:#e9c75a;--warnbg:#2e2914}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+main{max-width:1200px;margin:0 auto;padding:28px 16px 60px}
+h1{font-size:22px;margin:0 0 4px}h2{font-size:16px;margin:32px 0 10px}
+.sub{color:var(--muted);margin:0 0 20px}
+.bins{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin-bottom:20px;color:var(--muted)}
+.bins b{color:var(--ink);font-weight:600;overflow-wrap:anywhere}
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+@media (max-width:640px){.cards{grid-template-columns:repeat(2,1fr)}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.card .n{font-size:24px;font-weight:650;font-variant-numeric:tabular-nums}
+.card .l{color:var(--muted);font-size:12px}
+.card.hot .n{color:var(--long)}
+.wrap{overflow-x:auto;background:var(--panel);border:1px solid var(--line);border-radius:10px}
+table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
+th,td{padding:7px 10px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
+th{font-size:12px;color:var(--muted);font-weight:600;position:sticky;top:0;background:var(--panel);cursor:pointer;user-select:none}
+tr:last-child td{border-bottom:0}
+td.num,th.num{text-align:right}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}
+.long{color:var(--long)}.short{color:var(--short)}
+.barcell{min-width:140px}
+.bar{height:8px;border-radius:4px;background:var(--accent);opacity:.8}
+.note{color:var(--warn);font-size:12px}
+.muted{color:var(--muted)}
+.warnbox{background:var(--warnbg);color:var(--warn);border-radius:8px;padding:10px 12px;margin-top:12px}
+.empty{padding:16px;color:var(--muted)}
+details{margin-top:8px}summary{cursor:pointer;color:var(--muted)}
+footer{margin-top:48px;color:var(--muted);font-size:11px;opacity:.7}
+.filter{margin:0 0 10px;padding:7px 10px;width:100%;max-width:320px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--ink)}
+"""
+
+JS = """
+document.querySelectorAll('table.sortable').forEach(function(t){
+  t.querySelectorAll('th').forEach(function(th,i){th.addEventListener('click',function(){
+    var b=t.tBodies[0],rows=[].slice.call(b.rows),asc=th.dataset.asc!=='1';th.dataset.asc=asc?'1':'0';
+    rows.sort(function(x,y){var a=x.cells[i].dataset.v||x.cells[i].textContent,c=y.cells[i].dataset.v||y.cells[i].textContent;
+      var na=parseFloat(a),nc=parseFloat(c);if(!isNaN(na)&&!isNaN(nc))return asc?na-nc:nc-na;return asc?a.localeCompare(c):c.localeCompare(a)});
+    rows.forEach(function(r){b.appendChild(r)});});});});
+var f=document.getElementById('filter');if(f)f.addEventListener('input',function(){var q=f.value.toLowerCase();
+  document.querySelectorAll('#ranked tbody tr').forEach(function(r){r.style.display=r.textContent.toLowerCase().indexOf(q)>-1?'':'none'})});
+"""
+
+
+def e(s) -> str:
+    return html.escape(str(s) if s is not None else "")
+
+
+def _td(text, cls="", v=None) -> str:
+    return "<td%s%s>%s</td>" % (" class='%s'" % cls if cls else "",
+                                 " data-v='%s'" % e(v) if v is not None else "", text)
+
+
+def _th(text, num=False) -> str:
+    return '<th%s>%s</th>' % (' class="num"' if num else "", e(text))
+
+
+def _table(head: List[str], rows: List[str], tid: str = "") -> str:
+    return ('<div class="wrap"><table %sclass="sortable"><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>'
+            % ('id="%s" ' % tid if tid else "", "".join(head), "".join(rows)))
+
+
+def clip_table(clips: List[Clip], opts: ReportOptions) -> str:
+    if not clips:
+        return '<div class="empty">None</div>'
+    head = [_th("Clip")]
+    if opts.on("tape"): head.append(_th("Tape"))
+    head.append(_th("Duration", True))
+    if opts.on("start_tc"): head.append(_th("Start", True))
+    if opts.on("frames"): head.append(_th("Frames", True))
+    if opts.on("fps"): head.append(_th("FPS", True))
+    rows = []
+    for c in sorted(clips, key=lambda c: (c.name.lower(), c.tape.lower())):
+        r = [_td(e(c.name))]
+        if opts.on("tape"): r.append(_td(e(c.tape) or "—"))
+        r.append(_td(e(dur_tc(c)) or "?", "mono num", c.frames))
+        if opts.on("start_tc"): r.append(_td(e(c.start_tc) or "—", "mono num"))
+        if opts.on("frames"): r.append(_td("" if c.frames is None else c.frames, "mono num", c.frames))
+        if opts.on("fps"): r.append(_td(e(fmt_fps(c.fps)), "num", c.fps))
+        rows.append("<tr>%s</tr>" % "".join(r))
+    return _table(head, rows)
+
+
+def ranked_table(flagged: List["Pair"], opts: ReportOptions) -> str:
+    if not flagged:
+        return '<div class="wrap"><div class="empty">No duration differences — every matched clip has the same duration.</div></div>'
+    max_abs = max(abs(p.diff) for p in flagged) or 1
+    head = [_th("Rank", True), _th("Clip")]
+    if opts.on("tape"): head.append(_th("Tape"))
+    if opts.on("dur_a"): head.append(_th("Duration A", True))
+    if opts.on("dur_b"): head.append(_th("Duration B", True))
+    if opts.on("start_tc"): head += [_th("Start A", True), _th("Start B", True)]
+    if opts.on("frames"): head += [_th("Frames A", True), _th("Frames B", True)]
+    if opts.on("fps"): head.append(_th("FPS", True))
+    if opts.on("diff_tc"): head.append(_th("Diff (TC)", True))
+    if opts.on("diff_frames"): head.append(_th("Diff (fr)", True))
+    if opts.on("diff_sec"): head.append(_th("Diff (sec)", True))
+    if opts.on("direction"): head.append(_th("B vs A"))
+    if opts.on("magnitude"): head.append(_th("Magnitude"))
+
+    rows = []
+    for i, p in enumerate(flagged, 1):
+        d = p.diff
+        cls = "long" if d > 0 else "short"
+        note = "<div class='note'>%s</div>" % e(p.note) if p.note else ""
+        name = "<b>%s</b>" % e(p.a.name)
+        if p.b.name != p.a.name:
+            name += "<br><span class='muted'>B: %s</span>" % e(p.b.name)
+        if not opts.on("tape"):
+            name += note
+        r = [_td(i, "num", i), _td(name)]
+        if opts.on("tape"): r.append(_td(e(p.tape) + note))
+        if opts.on("dur_a"): r.append(_td(e(dur_tc(p.a)), "mono num", p.a.frames))
+        if opts.on("dur_b"): r.append(_td(e(dur_tc(p.b)), "mono num", p.b.frames))
+        if opts.on("start_tc"):
+            r += [_td(e(p.a.start_tc) or "—", "mono num"), _td(e(p.b.start_tc) or "—", "mono num")]
+        if opts.on("frames"): r += [_td(p.a.frames, "mono num", p.a.frames), _td(p.b.frames, "mono num", p.b.frames)]
+        if opts.on("fps"): r.append(_td(e(fmt_fps(p.a.fps)), "num", p.a.fps))
+        if opts.on("diff_tc"): r.append(_td(e(signed_tc(d, p.a.fps)), "mono num " + cls, d))
+        if opts.on("diff_frames"): r.append(_td("%+d" % d, "mono num " + cls, d))
+        if opts.on("diff_sec"): r.append(_td("%.2fs" % p.abs_seconds, "num", "%.4f" % p.abs_seconds))
+        if opts.on("direction"): r.append(_td("B %s" % ("longer" if d > 0 else "shorter"), cls))
+        if opts.on("magnitude"):
+            r.append(_td("<div class='bar' style='width:%.1f%%'></div>" % max(2.0, 100.0 * abs(d) / max_abs),
+                         "barcell", abs(d)))
+        rows.append("<tr>%s</tr>" % "".join(r))
+    return ('<input id="filter" class="filter" placeholder="Filter by clip or tape name…">'
+            + _table(head, rows, "ranked"))
+
+
+def write_html(res: Result, path: str, opts: ReportOptions = None):
+    opts = opts or ReportOptions()
+    flagged = res.flagged
+    fps_set = sorted({c.fps for c in res.a.clips + res.b.clips})
+    total_abs = sum(abs(p.diff) for p in flagged)
+    fps0 = fps_set[0] if fps_set else 24
+
+    warnings = []
+    if len(fps_set) > 1:
+        warnings.append("Clips use more than one frame rate (%s fps). Frame differences are counted at each clip's own rate."
+                        % ", ".join(fmt_fps(x) for x in fps_set))
+    if res.dup_tapes:
+        warnings.append("%d tape name(s) are used by more than one clip in a bin. Those clips were paired by identical clip name "
+                        "first, then in bin order — check rows marked with a note." % len(res.dup_tapes))
+    if res.unknown:
+        warnings.append("%d matched clip(s) had a duration that couldn't be read: %s"
+                        % (len(res.unknown), ", ".join(e(p.tape) for p in res.unknown[:20])))
+    warn_html = "".join('<div class="warnbox">%s</div>' % w for w in warnings)
+
+    parts = []
+    show_path = (lambda b: b.path) if opts.on("paths") else (lambda b: b.label)
+    parts.append('<div class="bins"><span>A</span><b>%s</b><span>B</span><b>%s</b></div>'
+                 % (e(show_path(res.a)), e(show_path(res.b))))
+
+    if opts.on("summary"):
+        biggest = flagged[0] if flagged else None
+        cards = [
+            ("Clips in A", len(res.a.clips), ""), ("Clips in B", len(res.b.clips), ""),
+            ("Matched by tape", len(res.pairs), ""),
+            ("Duration differences", len(flagged), "hot" if flagged else ""),
+            ("Biggest difference", signed_tc(biggest.diff, biggest.a.fps) if biggest else "—", "hot" if biggest else ""),
+            ("Total |difference|", frames_to_tc(total_abs, fps0) if flagged else "—", ""),
+            ("Only in A", len(res.only_a), ""), ("Only in B", len(res.only_b), ""),
+        ]
+        if res.no_tape_a or res.no_tape_b:
+            cards.append(("No tape name (A / B)", "%d / %d" % (len(res.no_tape_a), len(res.no_tape_b)), "hot"))
+        parts.append('<div class="cards">%s</div>' % "".join(
+            '<div class="card %s"><div class="n">%s</div><div class="l">%s</div></div>' % (c, e(n), e(l))
+            for l, n, c in cards))
+    parts.append(warn_html)
+
+    parts.append("<h2>Duration differences, ranked largest first (%d)</h2>%s" % (len(flagged), ranked_table(flagged, opts)))
+    if opts.on("only_a"):
+        parts.append("<h2>Only in A (%d)</h2>%s" % (len(res.only_a), clip_table(res.only_a, opts)))
+    if opts.on("only_b"):
+        parts.append("<h2>Only in B (%d)</h2>%s" % (len(res.only_b), clip_table(res.only_b, opts)))
+    if opts.on("no_tape") and (res.no_tape_a or res.no_tape_b):
+        parts.append("<h2>No tape name in A — not compared (%d)</h2>%s" % (len(res.no_tape_a), clip_table(res.no_tape_a, opts)))
+        parts.append("<h2>No tape name in B — not compared (%d)</h2>%s" % (len(res.no_tape_b), clip_table(res.no_tape_b, opts)))
+    if opts.on("same"):
+        if res.matching:
+            head = [_th("Clip")] + ([_th("Tape")] if opts.on("tape") else []) + [_th("Duration", True)]
+            if res.tolerance: head.append(_th("Diff (fr)", True))
+            rows = []
+            for p in sorted(res.matching, key=lambda p: p.a.name.lower()):
+                r = [_td(e(p.a.name))] + ([_td(e(p.tape))] if opts.on("tape") else [])
+                r.append(_td(e(dur_tc(p.a)), "mono num", p.a.frames))
+                if res.tolerance: r.append(_td("%+d" % p.diff if p.diff else "0", "mono num", p.diff))
+                rows.append("<tr>%s</tr>" % "".join(r))
+            same = ('<details><summary>Show %d clip(s)</summary><div style="margin-top:8px">%s</div></details>'
+                    % (len(res.matching), _table(head, rows)))
+        else:
+            same = '<div class="empty">None</div>'
+        parts.append("<h2>Same duration (%d)</h2>%s" % (len(res.matching), same))
+
+    tol = (" Differences of %d frame(s) or less are ignored." % res.tolerance) if res.tolerance else ""
+    doc = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Bin Duration Diff</title><style>%s</style></head>
+<body><main>
+<h1>Bin duration report</h1>
+<p class="sub">Clips matched by tape name. Diff = Duration B − Duration A. Generated %s.%s</p>
+%s
+<footer>Bin Duration Diff · by Alex Stuart</footer>
+</main><script>%s</script></body></html>""" % (
+        CSS, e(_dt.datetime.now().strftime("%Y-%m-%d %H:%M")), e(tol), "\n".join(parts), JS)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(doc)
+
+
+def print_summary(res: Result):
+    flagged = res.flagged
+    print("A: %s  (%d clips)" % (res.a.path, len(res.a.clips)))
+    print("B: %s  (%d clips)" % (res.b.path, len(res.b.clips)))
+    print("Matched by tape: %d   Different: %d   Only in A: %d   Only in B: %d   No tape: %d/%d"
+          % (len(res.pairs), len(flagged), len(res.only_a), len(res.only_b),
+             len(res.no_tape_a), len(res.no_tape_b)))
+    if flagged:
+        print("\nDuration differences, largest first (B - A):")
+        wn = max(len(p.a.name) for p in flagged)
+        wt = max(len(p.tape) for p in flagged)
+        for i, p in enumerate(flagged, 1):
+            print("  %3d. %-*s  %-*s  %13s  %+6d fr   %s -> %s" % (
+                i, wn, p.a.name, wt, p.tape, ("+" if p.diff > 0 else "") + frames_to_tc(p.diff, p.a.fps),
+                p.diff, frames_to_tc(p.a.frames, p.a.fps), frames_to_tc(p.b.frames, p.b.fps)))
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Compare clip durations between two Avid bins, matched by tape name.")
+    ap.add_argument("bin_a", help="First bin (.avb, .ale, or tab-delimited export)")
+    ap.add_argument("bin_b", help="Second bin")
+    ap.add_argument("-o", "--output", help="HTML report path (default: <A>_vs_<B>_durations.html next to bin A)")
+    ap.add_argument("--fps", type=float, default=24.0,
+                    help="Frame rate for text exports that don't state one (default 24). .avb/.ale carry their own.")
+    ap.add_argument("--tolerance", type=int, default=0, help="Ignore differences of this many frames or fewer (default 0)")
+    ap.add_argument("--include-subclips", action="store_true", help=".avb only: also compare subclips. By default only master clips are "
+                         "compared, except in a bin with no master clips, where its subclips are used.")
+    ap.add_argument("--case-sensitive", action="store_true", help="Treat tape names with different case as different tapes")
+    ap.add_argument("--tape-column", help="Column name to use as the tape name in text exports")
+    ap.add_argument("--duration-column", help="Column name to use as the duration in text exports")
+    ap.add_argument("--no-csv", action="store_true", help="Don't write the CSV alongside the HTML report")
+    ap.add_argument("--open", action="store_true", help="Open the report in your browser when done")
+    ap.add_argument("--hide", metavar="KEYS", help="Comma-separated report parts to leave out. Sections: %s. "
+                    "Columns: %s." % (", ".join(SECTIONS), ", ".join(COLUMNS)))
+    ap.add_argument("--show", metavar="KEYS", help="Comma-separated extra information to add: %s." % ", ".join(EXTRAS))
+    ap.add_argument("--json", action="store_true", help=argparse.SUPPRESS)  # used by the Mac app
+    args = ap.parse_args(argv)
+    opts = ReportOptions(hide=parse_keys(args.hide), show=parse_keys(args.show))
+
+    a, b = load_bin(args.bin_a, args), load_bin(args.bin_b, args)
+    res = compare(a, b, args.tolerance, args.case_sensitive)
+
+    out = args.output
+    if not out:
+        stem = lambda p: os.path.splitext(os.path.basename(p))[0]
+        out = os.path.join(os.path.dirname(os.path.abspath(args.bin_a)),
+                           "%s_vs_%s_durations.html" % (stem(args.bin_a), stem(args.bin_b)))
+    out_dir = os.path.dirname(os.path.abspath(out))
+    os.makedirs(out_dir, exist_ok=True)
+    write_html(res, out, opts)
+    csv_path = None
+    if not args.no_csv:
+        csv_path = os.path.splitext(out)[0] + ".csv"
+        write_csv(res, csv_path, opts)
+    if args.json:
+        flagged = res.flagged
+        top = flagged[0] if flagged else None
+        print(json.dumps({
+            "differences": len(flagged), "matched": len(res.pairs),
+            "only_a": len(res.only_a), "only_b": len(res.only_b),
+            "no_tape_a": len(res.no_tape_a), "no_tape_b": len(res.no_tape_b),
+            "biggest_clip": top.a.name if top else None,
+            "biggest_tc": (("+" if top.diff > 0 else "") + frames_to_tc(top.diff, top.a.fps)) if top else None,
+            "biggest_frames": top.diff if top else None,
+            "report": os.path.abspath(out), "csv": csv_path and os.path.abspath(csv_path),
+        }))
+    else:
+        print_summary(res)
+        print("\nReport: %s" % out)
+        if csv_path:
+            print("CSV:    %s" % csv_path)
+    if args.open:
+        webbrowser.open("file://" + os.path.abspath(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
