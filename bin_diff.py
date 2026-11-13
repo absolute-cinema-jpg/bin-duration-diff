@@ -1090,9 +1090,10 @@ def write_html(res: Result, path: str, opts: ReportOptions = None, unchecked: Op
         parts.append('<div id="all-hidden" class="wrap empty colhidden">All columns with differences are hidden. '
                      'Tick them in “Differences by column” to show them.</div>')
     if opts.on("columns"):
-        parts.append("<h2>Columns not compared</h2>"
+        # Shown in the app and browser, left out of PDFs and printouts.
+        parts.append("<section class='noprint'><h2>Columns not compared</h2>"
                      "<p class='muted'>Only in bin A:</p>%s<p class='muted'>Only in bin B:</p>%s"
-                     "<p class='muted'>Turned off in settings:</p>%s"
+                     "<p class='muted'>Turned off in settings:</p>%s</section>"
                      % (_chips(res.columns_only_a), _chips(res.columns_only_b), _chips(res.ignored_columns)))
     if opts.on("only_a"):
         parts.append("<h2>Only in A (%d)</h2>%s" % (len(res.only_a), clip_table(res.only_a, opts)))
@@ -1124,7 +1125,7 @@ def write_html(res: Result, path: str, opts: ReportOptions = None, unchecked: Op
 <h1>Bin comparison report</h1>
 <p class="sub">Clips are linked by tape name; every other shared column is compared. Generated %s. %s</p>
 %s
-<footer>%s · by Alex Stuart</footer>
+<footer>%s</footer>
 </main><script>%s</script></body></html>""" % (
         APP_NAME, CSS, e(json.dumps(sorted(col_key(c) for c in (unchecked or set())))),
         e(_dt.datetime.now().strftime("%Y-%m-%d %H:%M")), e(" ".join(notes)),
