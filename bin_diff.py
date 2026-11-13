@@ -681,6 +681,8 @@ SECTIONS = ["paths", "summary", "by_column", "durations", "metadata", "columns",
 COLUMNS = ["tape", "dur_a", "dur_b", "diff_tc", "diff_frames", "diff_sec", "direction", "magnitude"]
 # Off by default (turn on with --show): extra duration-table columns.
 EXTRAS = ["start_tc", "frames", "fps"]
+# Sections that are off by default (turn on with --show).
+OPTIONAL_SECTIONS = ["summary"]
 REPORT_KEYS = SECTIONS + COLUMNS + EXTRAS
 
 
@@ -690,7 +692,9 @@ class ReportOptions:
     show: Set[str] = field(default_factory=set)
 
     def on(self, key: str) -> bool:
-        return key in self.show if key in EXTRAS else key not in self.hide
+        if key in EXTRAS or key in OPTIONAL_SECTIONS:
+            return key in self.show
+        return key not in self.hide
 
 
 def parse_keys(s: Optional[str]) -> Set[str]:
@@ -794,6 +798,7 @@ footer{margin-top:48px;color:var(--muted);font-size:11px;opacity:.7}
 #bycol td.cb{width:28px}
 #bycol input{width:16px;height:16px;cursor:pointer;accent-color:var(--accent)}
 .colhidden{display:none!important}
+h2 .count{font-weight:500;font-size:13px;color:var(--muted);margin-left:6px}
 @media print{
   :root{--bg:#fff;--panel:#fff;--ink:#111;--muted:#666;--line:#ccc;--accent:#2f5bd3;--long:#a14a14;--short:#1f6b4c;
         --warn:#7a5d00;--warnbg:#fff6d9;--olda:#fbe7e1;--newb:#e2f2e8}
@@ -809,6 +814,8 @@ footer{margin-top:48px;color:var(--muted);font-size:11px;opacity:.7}
   .mono{font-size:10px}
   .card{padding:6px 8px}.card .n{font-size:16px}
   tr,.card{break-inside:avoid}
+  section.colsec{break-inside:avoid;page-break-inside:avoid}
+  h2{page-break-after:avoid}
   footer{margin-top:20px}
 }
 """
@@ -822,27 +829,25 @@ function apply(notify){
   document.querySelectorAll('#bycol tr.colrow').forEach(function(r){
     var on=!unchecked.has(r.dataset.col);r.classList.toggle('off',!on);
     var cb=r.querySelector('input');if(cb)cb.checked=on});
-  var clips=new Set(),shown=0;
-  document.querySelectorAll('#metadata tbody tr').forEach(function(r){
-    var on=!unchecked.has(r.dataset.col);r.classList.toggle('colhidden',!on);
-    if(on){shown++;clips.add(r.dataset.pair)}});
+  var clips=new Set(),shownCols=0,shownMeta=0,secs=document.querySelectorAll('section.colsec');
+  secs.forEach(function(sec){
+    var on=!unchecked.has(sec.dataset.col);sec.classList.toggle('colhidden',!on);
+    if(!on)return;shownCols++;
+    sec.querySelectorAll('tbody tr').forEach(function(r){clips.add(r.dataset.pair);if(sec.dataset.col!=='duration')shownMeta++})});
   var durOn=!unchecked.has('duration');
-  var ds=document.getElementById('sec-durations');if(ds)ds.classList.toggle('colhidden',!durOn);
   document.querySelectorAll('.card.c-dur').forEach(function(c){c.classList.toggle('dim',!durOn)});
-  if(durOn)document.querySelectorAll('#durations tbody tr').forEach(function(r){clips.add(r.dataset.pair)});
-  setText('n-meta',shown);setText('h-meta',shown);setText('n-clips',clips.size);
-  var none=document.getElementById('meta-none');if(none)none.classList.toggle('colhidden',shown>0||!document.querySelector('#metadata'));
-  var mt=document.getElementById('meta-table');if(mt)mt.classList.toggle('colhidden',shown==0);
+  setText('n-meta',shownMeta);setText('n-clips',clips.size);
+  var none=document.getElementById('all-hidden');if(none)none.classList.toggle('colhidden',shownCols>0||!secs.length);
   var list=Array.from(unchecked);body.dataset.unchecked=JSON.stringify(list);
   if(notify&&window.webkit&&webkit.messageHandlers&&webkit.messageHandlers.bindiff)
     webkit.messageHandlers.bindiff.postMessage({unchecked:list});
 }
 document.querySelectorAll('#bycol tr.colrow').forEach(function(r){
-  r.addEventListener('click',function(ev){
+  r.addEventListener('click',function(){
     var c=r.dataset.col;if(unchecked.has(c))unchecked.delete(c);else unchecked.add(c);apply(true)})});
 document.querySelectorAll('[data-act]').forEach(function(b){b.addEventListener('click',function(){
-  var rows=document.querySelectorAll('#bycol tr.colrow');
-  rows.forEach(function(r){if(b.dataset.act==='all')unchecked.delete(r.dataset.col);else unchecked.add(r.dataset.col)});
+  document.querySelectorAll('#bycol tr.colrow').forEach(function(r){
+    if(b.dataset.act==='all')unchecked.delete(r.dataset.col);else unchecked.add(r.dataset.col)});
   apply(true)})});
 document.querySelectorAll('table.sortable').forEach(function(t){
   t.querySelectorAll('th').forEach(function(th,i){th.addEventListener('click',function(){
@@ -953,27 +958,28 @@ def duration_table(flagged: List[Pair], opts: ReportOptions, pair_ids: Dict[int,
             r.append(_td("<div class='bar' style='width:%.1f%%'></div>" % max(2.0, 100.0 * abs(d) / max_abs),
                          "barcell", abs(d)))
         rows.append("<tr data-pair='%d'>%s</tr>" % (pair_ids[id(p)], "".join(r)))
-    return _filter("durations", "Filter by clip or tape name…") + _table(head, rows, "durations")
+    filt = _filter("durations", "Filter by clip or tape name…") if len(rows) > 20 else ""
+    return filt + _table(head, rows, "durations")
 
 
-def metadata_table(diffs: List[MetaDiff], opts: ReportOptions, pair_ids: Dict[int, int]) -> str:
-    if not diffs:
-        return '<div class="wrap"><div class="empty">No metadata differences in the compared columns.</div></div>'
-    head = [_th("Clip")] + ([_th("Tape")] if opts.on("tape") else []) + [_th("Column"), _th("Bin A"), _th("Bin B")]
+def column_section(col: str, diffs: List[MetaDiff], index: int, pair_ids: Dict[int, int]) -> str:
+    """One column's differences: Clip | Bin A | Bin B."""
     rows = []
-    for d in diffs:
+    for d in sorted(diffs, key=lambda d: d.pair.a.name.lower()):
         p = d.pair
         note = "<div class='note'>%s</div>" % e(p.note) if p.note else ""
-        r = [_td(_clip_name(p) + ("" if opts.on("tape") else note))]
-        if opts.on("tape"): r.append(_td(e(p.tape) + note))
-        r.append(_td("<b>%s</b>" % e(d.column)))
-        r.append(_td(e(d.a) if d.a else "<span class='muted'>(empty)</span>", "wrapcell va"))
-        r.append(_td(e(d.b) if d.b else "<span class='muted'>(empty)</span>", "wrapcell vb"))
-        rows.append("<tr data-col='%s' data-pair='%d'>%s</tr>" % (e(col_key(d.column)), pair_ids[id(p)], "".join(r)))
-    return ('<div id="meta-table">' + _filter("metadata", "Filter by clip, tape, column or value…")
-            + _table(head, rows, "metadata") + '</div>'
-            + '<div id="meta-none" class="wrap empty colhidden">All columns with differences are hidden. '
-              'Tick them in “Differences by column” to show them.</div>')
+        rows.append("<tr data-pair='%d'>%s%s%s</tr>" % (
+            pair_ids[id(p)], _td(_clip_name(p) + note),
+            _td(e(d.a) if d.a else "<span class='muted'>(empty)</span>", "wrapcell va"),
+            _td(e(d.b) if d.b else "<span class='muted'>(empty)</span>", "wrapcell vb")))
+    tid = "col-%d" % index
+    filt = _filter(tid, "Filter…") if len(rows) > 20 else ""
+    return section_html(col, len(diffs), filt + _table([_th("Clip"), _th("Bin A"), _th("Bin B")], rows, tid))
+
+
+def section_html(col: str, n: int, body: str, sub: str = "") -> str:
+    return ('<section class="colsec" data-col="%s"><h2>%s <span class="count">%d clip%s%s</span></h2>%s</section>'
+            % (e(col_key(col)), e(col), n, "" if n == 1 else "s", e(sub), body))
 
 
 def sorted_counts(res: Result) -> List[Tuple[str, int]]:
@@ -1065,12 +1071,24 @@ def write_html(res: Result, path: str, opts: ReportOptions = None, unchecked: Op
 
     if opts.on("by_column"):
         parts.append("<h2>Differences by column</h2>%s" % by_column_table(res))
-    if opts.on("durations") and res.compare_duration:
-        parts.append('<section id="sec-durations"><h2>Duration differences, ranked largest first (%d)</h2>%s</section>'
-                     % (len(flagged), duration_table(flagged, opts, pair_ids)))
-    if opts.on("metadata"):
-        parts.append('<h2>Metadata differences (<span id="h-meta">%d</span>)</h2>%s'
-                     % (len(meta), metadata_table(meta, opts, pair_ids)))
+    # One section per column with differences, in the same order as the overview.
+    by_col: "OrderedDict[str, List[MetaDiff]]" = OrderedDict()
+    for d in meta:
+        by_col.setdefault(d.column, []).append(d)
+    sections = []
+    for i, (col, n) in enumerate(sorted_counts(res)):
+        if not n:
+            continue
+        if col == "Duration" and res.compare_duration:
+            if opts.on("durations"):
+                sections.append(section_html("Duration", len(flagged), duration_table(flagged, opts, pair_ids),
+                                             " · largest difference first"))
+        elif opts.on("metadata") and col in by_col:
+            sections.append(column_section(col, by_col[col], i, pair_ids))
+    parts.extend(sections)
+    if sections:
+        parts.append('<div id="all-hidden" class="wrap empty colhidden">All columns with differences are hidden. '
+                     'Tick them in “Differences by column” to show them.</div>')
     if opts.on("columns"):
         parts.append("<h2>Columns not compared</h2>"
                      "<p class='muted'>Only in bin A:</p>%s<p class='muted'>Only in bin B:</p>%s"
@@ -1162,7 +1180,7 @@ def main(argv=None):
     ap.add_argument("--no-csv", action="store_true", help="Don't write the CSV alongside the HTML report")
     ap.add_argument("--hide", metavar="KEYS", help="Comma-separated report parts to leave out. Sections: %s. "
                     "Duration table columns: %s." % (", ".join(SECTIONS), ", ".join(COLUMNS)))
-    ap.add_argument("--show", metavar="KEYS", help="Comma-separated extra duration-table columns: %s." % ", ".join(EXTRAS))
+    ap.add_argument("--show", metavar="KEYS", help="Comma-separated extras to add: %s (duration table), summary (boxes at the top)." % ", ".join(EXTRAS))
     ap.add_argument("--unchecked", metavar="NAMES", help="Comma-separated columns to start unticked (hidden) in the report's column list")
     ap.add_argument("--open", action="store_true", help="Open the report in your browser when done")
     ap.add_argument("--json", action="store_true", help=argparse.SUPPRESS)  # used by the Mac app

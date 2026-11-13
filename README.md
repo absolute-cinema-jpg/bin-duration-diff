@@ -20,7 +20,7 @@ Runs on Intel and Apple Silicon Macs, macOS 11 or later. Python and everything e
 ### Settings
 
 - **Columns** — which columns are compared. Columns from bins you compare are added automatically; untick any you don't care about (Modified Date is off by default). Optionally ignore upper/lower case differences in values.
-- **Report** — which sections appear (summary, differences by column, ranked durations, metadata differences, columns not compared, only in A/B, no tape name, identical clips) and the duration table's columns.
+- **Report** — which sections appear (differences by column, a section for each differing column, columns not compared, only in A/B, no tape name, identical clips, and optional summary boxes) and the duration table's columns.
 - **General** — the folder for PDFs and saved reports, optionally save every report automatically (with a CSV), also open in the browser, ignore duration differences of up to N frames, case-sensitive tape names, include subclips.
 
 ## Inputs

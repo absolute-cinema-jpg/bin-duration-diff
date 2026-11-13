@@ -122,8 +122,8 @@ enum ReportParts {
         ("paths", "Full bin file paths"),
         ("summary", "Summary boxes at the top"),
         ("by_column", "Differences by column (with show/hide ticks)"),
-        ("durations", "Duration differences, ranked"),
-        ("metadata", "Metadata differences"),
+        ("durations", "Duration section, largest difference first"),
+        ("metadata", "A section for each other column that differs"),
         ("columns", "Columns that weren't compared"),
         ("only_a", "Clips only in bin A"),
         ("only_b", "Clips only in bin B"),
@@ -145,11 +145,13 @@ enum ReportParts {
         ("frames", "Frame counts (A and B)"),
         ("fps", "Frame rate"),
     ]
-    static let defaultOn = (sections + columns).map { $0.0 }
+    /// Parts that are off unless turned on (bin_diff.py --show).
+    static let defaultOff = extras.map { $0.0 } + ["summary"]
+    static let defaultOn = (sections + columns).map { $0.0 }.filter { !defaultOff.contains($0) }
 
     static func key(_ part: String) -> String { "report.\(part)" }
     static func isOn(_ part: String) -> Bool {
-        Prefs.bool(key(part), !extras.contains { $0.0 == part })
+        Prefs.bool(key(part), !defaultOff.contains(part))
     }
     static func resetAll() {
         for (k, _) in sections + columns + extras { UserDefaults.standard.removeObject(forKey: key(k)) }
@@ -302,7 +304,7 @@ struct ReportToggle: View {
     init(_ part: String, _ label: String) {
         self.part = part
         self.label = label
-        _on = AppStorage(wrappedValue: !ReportParts.extras.contains { $0.0 == part }, ReportParts.key(part))
+        _on = AppStorage(wrappedValue: !ReportParts.defaultOff.contains(part), ReportParts.key(part))
     }
 
     var body: some View { Toggle(label, isOn: $on) }

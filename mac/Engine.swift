@@ -45,7 +45,7 @@ func engineOptions(fps: String) -> [String] {
     let ignored = ColumnPrefs.shared.ignored.filter { !$0.contains(",") }
     if !ignored.isEmpty { args += ["--ignore-columns", ignored.joined(separator: ",")] }
     let hide = ReportParts.defaultOn.filter { !ReportParts.isOn($0) }
-    let show = ReportParts.extras.map { $0.0 }.filter { ReportParts.isOn($0) }
+    let show = ReportParts.defaultOff.filter { ReportParts.isOn($0) }
     if !hide.isEmpty { args += ["--hide", hide.joined(separator: ",")] }
     if !show.isEmpty { args += ["--show", show.joined(separator: ",")] }
     return args
