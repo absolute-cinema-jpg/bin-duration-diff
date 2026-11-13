@@ -62,8 +62,9 @@ final class ColumnPrefs: ObservableObject {
     static let shared = ColumnPrefs()
 
     /// Columns Bin Diff reads from .avb bins (named like Avid's bin columns).
-    static let builtIn = ["Name", "Duration", "Start", "End", "Tracks", "FPS", "Resolution",
-                          "Creation Date", "Modified Date"]
+    static let builtIn = ["Name", "Duration", "Start", "End", "Tracks", "FPS", "Video", "Raster Dimension",
+                          "Image Aspect Ratio", "Audio SR", "Audio Bit Depth", "Color", "Soundroll", "Sound TC",
+                          "Source File", "Source Path", "Drive", "Creation Date", "Modified Date"]
     static let ignoredByDefault = ["Modified Date"]
 
     @Published private(set) var known: [String]
@@ -73,6 +74,9 @@ final class ColumnPrefs: ObservableObject {
         let d = UserDefaults.standard
         known = d.stringArray(forKey: Prefs.knownColumns) ?? ColumnPrefs.builtIn
         ignored = d.stringArray(forKey: Prefs.ignoredColumns) ?? ColumnPrefs.ignoredByDefault
+        // Built-in columns added in later versions show up for existing users too.
+        let missing = ColumnPrefs.builtIn.filter { b in !known.contains { $0.caseInsensitiveCompare(b) == .orderedSame } }
+        if !missing.isEmpty { known += missing; save() }
     }
 
     func isCompared(_ c: String) -> Bool { !ignored.contains { $0.caseInsensitiveCompare(c) == .orderedSame } }

@@ -141,6 +141,7 @@ class Bin:
     path: str
     clips: List[Clip] = field(default_factory=list)
     columns: List[str] = field(default_factory=list)   # metadata columns found (not Tape)
+    unreadable: List[str] = field(default_factory=list)  # .avb: shown in the bin view, no values found
 
     @property
     def label(self) -> str:
@@ -283,9 +284,12 @@ def read_ale(path: str, args) -> Bin:
     return rows_to_bin(path, header, rows, fps or args.fps, args)
 
 
-# Columns read from .avb bins (named like Avid's bin columns), then any user columns.
-AVB_COLUMNS = ["Name", "Duration", "Start", "End", "Tracks", "FPS", "Resolution",
-               "Creation Date", "Modified Date"]
+# Avid's own bin columns that Bin Diff can work out from an .avb file (named as in Avid).
+AVB_COLUMNS = ["Name", "Duration", "Start", "End", "Tracks", "FPS", "Video", "Raster Dimension",
+               "Image Aspect Ratio", "Audio SR", "Audio Bit Depth", "Color", "Soundroll", "Sound TC",
+               "Source File", "Source Path", "Drive", "Creation Date", "Modified Date"]
+# Bin-view entries that are never data columns (icon column, Name etc. handled above).
+_VIEW_SKIP_TYPES = {200}
 
 
 def _fmt_value(v) -> str:
@@ -298,6 +302,17 @@ def _fmt_value(v) -> str:
     return str(v).strip()
 
 
+def _norm_key(s: str) -> str:
+    """'Shoot Date', '_SHOOT_DATE', 'ShootDate' -> 'shootdate'."""
+    return re.sub(r"[^0-9a-z]", "", str(s).lower())
+
+
+def _readable_key(k) -> bool:
+    """Skip Avid's scrambled internal keys (they aren't plain ASCII)."""
+    s = str(k)
+    return bool(s) and all(32 <= ord(ch) < 127 for ch in s)
+
+
 def read_avb(path: str, args) -> Bin:
     try:
         import avb  # type: ignore
@@ -306,7 +321,6 @@ def read_avb(path: str, args) -> Bin:
                          "Export the bin from Avid as Tab Delimited / ALE and use that instead.")
 
     b = Bin(path)
-    b.add_columns(AVB_COLUMNS)
 
     def comp_rate(comp) -> Optional[float]:
         r = getattr(comp, "edit_rate", None)
@@ -347,41 +361,134 @@ def read_avb(path: str, args) -> Bin:
                     return c
         return None
 
-    def find_source(mob, offset=0, depth=0, seen=None):
-        """Follow a clip back to its tape.
-        Returns (tape name, (start frames, tc base, drop) or None, resolution)."""
-        seen = seen if seen is not None else set()
-        if mob is None or depth > 8 or id(mob) in seen:
-            return None, None, ""
-        seen.add(id(mob))
-        desc = getattr(mob, "descriptor", None)
-        res = ""
-        try:
-            w, h = getattr(desc, "stored_width", None), getattr(desc, "stored_height", None)
-            if w and h:
-                res = "%dx%d" % (int(w), int(h))
-        except Exception:
-            res = ""
-        if desc is not None and type(desc).__name__ == "TapeDescriptor":
-            start = None
-            tc = timecode_of(mob)
-            try:
-                if tc is not None and int(tc.fps or 0) > 0:
-                    start = (int(tc.start or 0) + offset, int(tc.fps), bool(int(tc.flags or 0) & 1))
-            except Exception:
-                start = None
-            return mob.name, start, res
-        for t in ordered_tracks(mob):
-            for sc in walk_clips(t.component):
+    def source_chain(mob, kind: Optional[str]):
+        """Mobs behind a clip for one kind of track ('picture', 'sound', or None = first
+        track of any kind), nearest first, each with its offset into that mob."""
+        out, seen, offset, cur = [], {id(mob)}, 0, mob
+        for _ in range(8):
+            nxt = None
+            tracks = ordered_tracks(cur)
+            if kind:
+                tracks = [t for t in tracks if media_kind(t) == kind] or ([] if cur is mob else tracks)
+            for t in tracks:
+                for sc in walk_clips(t.component):
+                    try:
+                        ref = sc.mob
+                        start = int(getattr(sc, "start_time", 0) or 0)
+                    except Exception:
+                        ref, start = None, 0
+                    if ref is not None and id(ref) not in seen:
+                        nxt = (ref, offset + start)
+                    break
+                if nxt:
+                    break
+            if not nxt:
+                break
+            seen.add(id(nxt[0]))
+            out.append(nxt)
+            cur, offset = nxt
+        return out
+
+    def tape_in(chain):
+        """(tape name, start TC string or '') for the first tape mob in a chain."""
+        for m, off in chain:
+            desc = getattr(m, "descriptor", None)
+            if desc is not None and type(desc).__name__ == "TapeDescriptor":
+                tc = timecode_of(m)
                 try:
-                    ref = sc.mob
-                    sc_start = int(getattr(sc, "start_time", 0) or 0)
+                    if tc is not None and int(tc.fps or 0) > 0:
+                        return m.name, (int(tc.start or 0) + off, int(tc.fps), bool(int(tc.flags or 0) & 1))
                 except Exception:
-                    ref, sc_start = None, 0
-                tape, start, sub_res = find_source(ref, offset + sc_start, depth + 1, seen)
-                if tape:
-                    return tape, start, res or sub_res
-        return None, None, res
+                    pass
+                return m.name, None
+        return None, None
+
+    def descriptors(m):
+        d = getattr(m, "descriptor", None)
+        if d is None:
+            return []
+        out = [d]
+        for sub in getattr(d, "descriptors", None) or []:      # MultiDescriptor
+            out.append(sub)
+        return out
+
+    def picture_info(chain) -> Dict[str, str]:
+        info = {}
+        for m, _ in chain:
+            for d in descriptors(m):
+                try:
+                    w, h = getattr(d, "stored_width", None), getattr(d, "stored_height", None)
+                    if w and h and "Raster Dimension" not in info:
+                        info["Raster Dimension"] = "%dx%d" % (int(w), int(h))
+                    ar = getattr(d, "aspect_ratio", None)
+                    if ar and "Image Aspect Ratio" not in info:
+                        try:
+                            num, den = ar.numerator, ar.denominator
+                        except AttributeError:
+                            num, den = (ar[0], ar[1]) if isinstance(ar, (list, tuple)) else (float(ar), 1)
+                        if den:
+                            info["Image Aspect Ratio"] = "%d:%d" % (num, den) if float(num).is_integer() else "%.2f" % (num / den)
+                    rid = getattr(d, "resolution_id", None)
+                    if rid and "Video" not in info:
+                        info["Video"] = resolution_names.get(int(rid), "Resolution %d" % int(rid))
+                except Exception:
+                    pass
+        return info
+
+    def sound_info(chain) -> Dict[str, str]:
+        info = {}
+        for m, _ in chain:
+            for d in descriptors(m):
+                try:
+                    sr = getattr(d, "sample_rate", None)
+                    bits = getattr(d, "quantization_bits", None)
+                    summary = getattr(d, "summary", None)
+                    if (not sr or not bits) and isinstance(summary, (bytes, bytearray)) and type(d).__name__ == "WaveDescriptor":
+                        raw = bytes(summary)
+                        i = raw.find(b"fmt ")
+                        fmt = raw[i + 8:] if i >= 0 else raw
+                        if len(fmt) >= 16:
+                            import struct
+                            _, _, rate, _, _, depth = struct.unpack("<HHIIHH", fmt[:16])
+                            sr, bits = sr or rate, bits or depth
+                    if sr and "Audio SR" not in info and float(sr) >= 1000:
+                        info["Audio SR"] = "%g" % float(sr)
+                    if bits and "Audio Bit Depth" not in info:
+                        info["Audio Bit Depth"] = str(int(bits))
+                except Exception:
+                    pass
+        return info
+
+    def locator_info(chains) -> Dict[str, str]:
+        info = {}
+        for chain in chains:
+            for m, _ in chain:
+                for d in descriptors(m):
+                    locs = getattr(d, "locator", None)
+                    if locs is None:
+                        continue
+                    if not isinstance(locs, (list, tuple)) and not hasattr(locs, "__iter__"):
+                        locs = [locs]
+                    try:
+                        locs = list(locs)
+                    except Exception:
+                        locs = []
+                    for loc in locs:
+                        name = type(loc).__name__
+                        try:
+                            if name.endswith("FileLocator"):
+                                p = (getattr(loc, "path_posix", None) or getattr(loc, "path_utf8", None)
+                                     or getattr(loc, "path", None) or "")
+                                if p and "Source Path" not in info:
+                                    info["Source Path"] = str(p)
+                                    info["Source File"] = os.path.basename(str(p).rstrip("/"))
+                            elif name == "MSMLocator":
+                                v = getattr(loc, "last_known_volume_utf8", None) or getattr(loc, "last_known_volume", None)
+                                if v and "Drive" not in info:
+                                    info["Drive"] = str(v)
+                        except Exception:
+                            pass
+        return info
 
     def mob_rate(mob) -> Optional[float]:
         for t in ordered_tracks(mob):
@@ -403,36 +510,72 @@ def read_avb(path: str, args) -> Bin:
                 parts.append("%s1-%d" % (letter, n))
         return " ".join(parts)
 
-    def user_columns(mob) -> "OrderedDict[str, str]":
-        """Avid keeps bin columns like Scene, Take, Comments in the clip's attributes
-        (the "_USER" list); other non-internal attributes are included too."""
-        out = OrderedDict()
+    def attr_items(mob):
         try:
             attrs = mob.attributes
+            return list(attrs.items()) if attrs else []
         except Exception:
-            attrs = None
-        if not attrs:
-            return out
-        try:
-            items = list(attrs.items())
-        except Exception:
-            return out
-        for key, val in items:
+            return []
+
+    def user_columns(mob) -> "OrderedDict[str, str]":
+        """Avid keeps custom bin columns (Comments, Lens, ...) in the clip's "_USER" list;
+        other plain-named attributes are included too."""
+        out = OrderedDict()
+        for key, val in attr_items(mob):
             if key == "_USER":
                 try:
                     for k, v in val.items():
-                        s = _fmt_value(v)
-                        if k and not str(k).startswith("_"):
-                            out[str(k)] = s
+                        if _readable_key(k) and not str(k).startswith("_"):
+                            out[str(k)] = _fmt_value(v)
                 except Exception:
                     pass
-            elif not str(key).startswith("_"):
-                s = _fmt_value(val)
-                if isinstance(val, (str, int)):
-                    out[str(key)] = s
+            elif _readable_key(key) and not str(key).startswith("_") and isinstance(val, (str, int)):
+                out[str(key)] = _fmt_value(val)
         return out
 
+    def all_attributes(mobs) -> Dict[str, str]:
+        """Every readable string/number attribute on these mobs (and nested lists),
+        keyed by normalised name -- nearest mob wins."""
+        found = {}
+        def visit(items, depth):
+            for key, val in items:
+                if not _readable_key(key):
+                    continue
+                if hasattr(val, "items") and not isinstance(val, (str, bytes, bytearray)) and depth < 3:
+                    try:
+                        visit(list(val.items()), depth + 1)
+                    except Exception:
+                        pass
+                elif isinstance(val, (str, int, _dt.datetime)) and not isinstance(val, bool):
+                    found.setdefault(_norm_key(key), _fmt_value(val))
+        for m in mobs:
+            visit(attr_items(m), 0)
+        return found
+
+    def clip_color(mob) -> str:
+        a = dict(attr_items(mob))
+        rgb = [a.get("_COLOR_R"), a.get("_COLOR_G"), a.get("_COLOR_B")]
+        if all(isinstance(x, int) for x in rgb):
+            if max(rgb) > 255:
+                rgb = [x >> 8 for x in rgb]
+            return "#%02X%02X%02X" % tuple(max(0, min(255, x)) for x in rgb)
+        return ""
+
     with avb.open(path) as f:
+        # The bin's own column list: which columns it shows, and the names of video
+        # resolutions (Avid lists those as columns too, keyed by resolution ID).
+        view_cols = []
+        resolution_names = {}
+        try:
+            for c in f.content.view_setting.columns or []:
+                title, ctype = (c.get("title") or "").strip(), c.get("type")
+                if isinstance(ctype, int) and ctype >= 10000 and title:
+                    resolution_names[ctype] = title
+                elif title and ctype not in _VIEW_SKIP_TYPES:
+                    view_cols.append((title, bool(c.get("hidden")), ctype))
+        except Exception:
+            pass
+
         items = list(f.content.items)
         # Bins also carry hidden "reference clips" (e.g. the master clips behind
         # a subclip). Those aren't user_placed; skip them like Avid's bin view does.
@@ -446,6 +589,8 @@ def read_avb(path: str, args) -> Bin:
                 return False
         if not any(is_clip(it) for it in visible):
             visible = items
+
+        user_cols = []
         for item in visible:
             mob = item.mob
             try:
@@ -463,13 +608,21 @@ def read_avb(path: str, args) -> Bin:
                 length = int(mob.length)
             except Exception:
                 length = None
-            tape, start, res = find_source(mob)
-            start_s = end_s = ""
-            if start:
-                sf, base, drop = start
-                start_s = frames_to_clock_tc(sf, base, drop)
-                if length is not None:
-                    end_s = frames_to_clock_tc(sf + length, base, drop)
+
+            pic = source_chain(mob, "picture")
+            snd = source_chain(mob, "sound")
+            anyc = pic or snd or source_chain(mob, None)
+            tape, start = tape_in(pic or anyc)
+            sound_tape, sound_start = tape_in(snd)
+
+            def tc_pair(st):
+                if not st:
+                    return "", ""
+                sf, base, drop = st
+                return (frames_to_clock_tc(sf, base, drop),
+                        frames_to_clock_tc(sf + length, base, drop) if length is not None else "")
+            start_s, end_s = tc_pair(start)
+
             meta = OrderedDict([
                 ("Name", mob.name or ""),
                 ("Duration", frames_to_tc(length, rate) if length is not None else ""),
@@ -477,16 +630,51 @@ def read_avb(path: str, args) -> Bin:
                 ("End", end_s),
                 ("Tracks", tracks_label(mob)),
                 ("FPS", fmt_fps(rate)),
-                ("Resolution", res),
                 ("Creation Date", _fmt_value(getattr(mob, "creation_time", None))),
                 ("Modified Date", _fmt_value(getattr(mob, "last_modified", None))),
+                ("Color", clip_color(mob)),
             ])
+            meta.update(picture_info(pic or anyc))
+            meta.update(sound_info(snd))
+            meta.update(locator_info([pic, snd]))
+            # Sync clips: the audio comes from its own sound roll.
+            if sound_tape and tape and sound_tape != tape:
+                meta["Soundroll"] = sound_tape
+                meta["Sound TC"] = tc_pair(sound_start)[0]
+
             user = user_columns(mob)
-            b.add_columns(user.keys())
+            for k in user:
+                if k not in user_cols:
+                    user_cols.append(k)
             meta.update(user)
+
+            # Columns the bin shows that we haven't filled yet: look for an attribute with
+            # the same name anywhere on the clip or the media/tape behind it.
+            have = {_norm_key(k) for k, v in meta.items() if v}
+            if view_cols:
+                attrs = all_attributes([mob] + [m for m, _ in pic + snd])
+                for title, _, _ in view_cols:
+                    k = _norm_key(title)
+                    if k and k not in have and attrs.get(k):
+                        meta[title] = attrs[k]
+                        have.add(k)
+
             b.clips.append(Clip(name=mob.name or "(unnamed)", tape=tape or "", frames=length,
                                 fps=rate, kind=kind, start_tc=start_s, meta=meta,
                                 raw_duration=meta["Duration"]))
+
+        # Columns: Avid's own ones that have a value somewhere in this bin, then the rest.
+        filled = {}
+        for c in b.clips:
+            for k, v in c.meta.items():
+                if v:
+                    filled.setdefault(k.lower(), k)
+        b.add_columns([c for c in AVB_COLUMNS if c.lower() in filled or c in ("Name", "Duration")])
+        b.add_columns(user_cols)
+        b.add_columns([t for t, _, _ in view_cols if t.lower() in filled])
+        # Shown in the bin view, but no values found in the .avb file.
+        got = {_norm_key(c) for c in b.columns} | {"tape"}
+        b.unreadable = [t for t, hidden, _ in view_cols if not hidden and _norm_key(t) not in got]
     return b
 
 
@@ -1017,6 +1205,25 @@ def by_column_table(res: Result) -> str:
     return out
 
 
+def unreadable_columns(res: "Result") -> List[str]:
+    """Columns the bins' view shows that have no values in either .avb file."""
+    have = {c.lower() for c in res.a.columns + res.b.columns}
+    out = []
+    for c in res.a.unreadable + res.b.unreadable:
+        if c.lower() not in have and c not in out:
+            out.append(c)
+    return out
+
+
+def unreadable_html(res: "Result") -> str:
+    cols = unreadable_columns(res)
+    if not cols:
+        return ""
+    return ("<p class='muted'>Shown in the bin, but no values found in the .avb file — "
+            "Avid may keep these with the media rather than in the bin. To compare them, "
+            "export both bins from Avid as Tab Delimited text and compare those:</p>%s" % _chips(cols))
+
+
 def _chips(items: List[str]) -> str:
     if not items:
         return '<span class="muted">None</span>'
@@ -1093,8 +1300,9 @@ def write_html(res: Result, path: str, opts: ReportOptions = None, unchecked: Op
         # Shown in the app and browser, left out of PDFs and printouts.
         parts.append("<section class='noprint'><h2>Columns not compared</h2>"
                      "<p class='muted'>Only in bin A:</p>%s<p class='muted'>Only in bin B:</p>%s"
-                     "<p class='muted'>Turned off in settings:</p>%s</section>"
-                     % (_chips(res.columns_only_a), _chips(res.columns_only_b), _chips(res.ignored_columns)))
+                     "<p class='muted'>Turned off in settings:</p>%s%s</section>"
+                     % (_chips(res.columns_only_a), _chips(res.columns_only_b), _chips(res.ignored_columns),
+                        unreadable_html(res)))
     if opts.on("only_a"):
         parts.append("<h2>Only in A (%d)</h2>%s" % (len(res.only_a), clip_table(res.only_a, opts)))
     if opts.on("only_b"):
@@ -1161,6 +1369,9 @@ def print_summary(res: Result):
     not_compared = res.columns_only_a + res.columns_only_b
     if not_compared:
         print("\nColumns in only one bin (not compared): %s" % ", ".join(not_compared))
+    unread = unreadable_columns(res)
+    if unread:
+        print("\nShown in the bin but no values in the .avb file: %s" % ", ".join(unread))
 
 
 def main(argv=None):
@@ -1219,6 +1430,7 @@ def main(argv=None):
             "columns_only_a": res.columns_only_a, "columns_only_b": res.columns_only_b,
             "report": os.path.abspath(out), "csv": csv_path and os.path.abspath(csv_path),
             "bin_a": a.label, "bin_b": b.label,
+            "unreadable_columns": unreadable_columns(res),
         }))
     else:
         print_summary(res)

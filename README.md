@@ -25,7 +25,7 @@ Runs on Intel and Apple Silicon Macs, macOS 11 or later. Python and everything e
 
 ## Inputs
 
-- `.avb` Avid bins, read directly (via a bundled copy of [pyavb](https://github.com/markreidvfx/pyavb), MIT licence). Columns read: Name, Duration, Start, End, Tracks, FPS, Resolution, Creation Date, Modified Date, plus the clip's user columns.
+- `.avb` Avid bins, read directly (via a bundled copy of [pyavb](https://github.com/markreidvfx/pyavb), MIT licence). Columns read: Name, Duration, Start, End, Tracks, FPS, Video, Raster Dimension, Image Aspect Ratio, Audio SR, Audio Bit Depth, Color, Soundroll and Sound TC (sync clips), Source File, Source Path, Drive, Creation Date, Modified Date, the clip's user columns, and any other column the bin shows whose value is stored with the clip or its media. Columns the bin shows that have no values in the .avb file are listed in the report.
 - `.ale` exports
 - Tab-delimited bin exports (`.txt`/`.tab`/`.tsv`/`.csv`) — every exported column is compared.
 

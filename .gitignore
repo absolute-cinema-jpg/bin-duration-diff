@@ -7,3 +7,6 @@ __pycache__/
 # reports written next to bins when testing the CLI
 *_durations.html
 *_durations.csv
+
+# real bins for testing -- never published
+samples/
