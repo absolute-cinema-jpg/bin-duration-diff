@@ -984,6 +984,7 @@ footer{margin-top:48px;color:var(--muted);font-size:11px;opacity:.7}
 #bycol tr.colrow{cursor:pointer}
 #bycol tr.colrow.off td{opacity:.4}
 #bycol td.cb{width:28px}
+#bycol tr.grouprow td{font-size:12px;font-weight:600;color:var(--muted);padding-top:14px;background:var(--bg)}
 #bycol input{width:16px;height:16px;cursor:pointer;accent-color:var(--accent)}
 .colhidden{display:none!important}
 h2 .count{font-weight:500;font-size:13px;color:var(--muted);margin-left:6px}
@@ -1170,31 +1171,55 @@ def section_html(col: str, n: int, body: str, sub: str = "") -> str:
             % (e(col_key(col)), e(col), n, "" if n == 1 else "s", e(sub), body))
 
 
+def column_totals(res: Result) -> Dict[str, int]:
+    """How many linked clips each column was compared on."""
+    totals = {c: len(res.pairs) for c in res.compared_columns}
+    if res.compare_duration:
+        totals["Duration"] = sum(1 for p in res.pairs if p.diff is not None)
+    return totals
+
+
 def sorted_counts(res: Result) -> List[Tuple[str, int]]:
-    """Columns by number of clips that differ, most first (ties keep bin column order)."""
+    """Columns ordered for the overview: ones where some clips match and some differ
+    come first (most differences first); columns where every clip differs come after
+    them, since that's usually expected (e.g. a name suffix on every sync clip)."""
     counts = list(res.column_counts().items())
+    totals = column_totals(res)
     order = {c: i for i, (c, _) in enumerate(counts)}
-    return sorted(counts, key=lambda cn: (-cn[1], order[cn[0]]))
+
+    def every(cn):
+        c, n = cn
+        return n > 0 and n >= totals.get(c, 0) > 1
+    return sorted(counts, key=lambda cn: (every(cn), -cn[1], order[cn[0]]))
 
 
 def by_column_table(res: Result) -> str:
     counts = sorted_counts(res)
     if not counts:
         return '<div class="empty">No columns were compared.</div>'
+    totals = column_totals(res)
     with_diffs = [(c, n) for c, n in counts if n]
     zero = [c for c, n in counts if not n]
     if not with_diffs:
         out = '<div class="wrap"><div class="empty">No differences in any of the %d compared columns.</div></div>' % len(counts)
     else:
-        top = with_diffs[0][1] or 1
         rows = []
-        for col, n in with_diffs:
-            rows.append("<tr class='colrow' data-col='%s'>%s%s%s%s</tr>" % (
+        some = [(c, n) for c, n in with_diffs if not (n >= totals.get(c, 0) > 1)]
+        every = [(c, n) for c, n in with_diffs if (c, n) not in some]
+
+        def row(col, n):
+            total = totals.get(col, 0) or n
+            return "<tr class='colrow' data-col='%s'>%s%s%s%s</tr>" % (
                 e(col_key(col)),
                 _td("<input type='checkbox' checked aria-label='Show %s'>" % e(col), "cb"),
                 _td("<b>%s</b>" % e(col)),
-                _td(n, "num", n),
-                _td("<div class='bar' style='width:%.1f%%'></div>" % (100.0 * n / top), "barcell", n)))
+                _td("%d <span class='muted'>of %d</span>" % (n, total), "num", n),
+                _td("<div class='bar' style='width:%.1f%%'></div>" % max(2.0, 100.0 * n / total), "barcell", n))
+        rows += [row(c, n) for c, n in some]
+        if every:
+            rows.append("<tr class='grouprow'><td class='cb'></td><td colspan='3'>Different on every clip "
+                        "<span class='muted'>— often expected, e.g. a renamed clip or a new date</span></td></tr>")
+            rows += [row(c, n) for c, n in every]
         out = ('<div class="toolbar"><button data-act="all">Show all</button><button data-act="none">Hide all</button>'
                '<span class="hint">Tick the columns you want to see — the report below updates to match.</span></div>'
                + _table([_th("", cls="cb"), _th("Column"), _th("Clips that differ", True), _th("")], rows,
