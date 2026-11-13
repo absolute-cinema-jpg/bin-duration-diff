@@ -27,6 +27,8 @@ struct GitHubRelease: Decodable {
 final class Updater: ObservableObject {
     static let shared = Updater()
     @Published var busy = false
+    /// True once an update is being swapped in (the app is about to quit for it).
+    var installing = false
     @Published var status = ""
     private let lastCheckKey = "lastUpdateCheck"
 
@@ -56,7 +58,7 @@ final class Updater: ObservableObject {
     static func fetchLatest(_ done: @escaping (Result<GitHubRelease, Error>) -> Void) {
         var req = URLRequest(url: URL(string: "https://api.github.com/repos/\(AppInfo.repo)/releases/latest")!)
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-        req.setValue("BinDurationDiff/\(AppInfo.version)", forHTTPHeaderField: "User-Agent")
+        req.setValue("BinDiff/\(AppInfo.version)", forHTTPHeaderField: "User-Agent")
         req.timeoutInterval = 20
         URLSession.shared.dataTask(with: req) { data, resp, err in
             if let err = err { return done(.failure(err)) }
@@ -90,7 +92,7 @@ final class Updater: ObservableObject {
                     } else {
                         self.status = "You're up to date."
                         if userInitiated {
-                            showAlert("You're up to date", "Bin Duration Diff \(AppInfo.version) is the latest version.")
+                            showAlert("You're up to date", "Bin Diff \(AppInfo.version) is the latest version.")
                         }
                     }
                 }
@@ -100,7 +102,7 @@ final class Updater: ObservableObject {
 
     private func offer(_ rel: GitHubRelease) {
         let a = NSAlert()
-        a.messageText = "Bin Duration Diff \(rel.version) is available"
+        a.messageText = "Bin Diff \(rel.version) is available"
         var notes = (rel.body ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if notes.count > 700 { notes = String(notes.prefix(700)) + "…" }
         a.informativeText = "You have version \(AppInfo.version)." + (notes.isEmpty ? "" : "\n\nWhat's new:\n\(notes)")
@@ -121,7 +123,7 @@ final class Updater: ObservableObject {
     static func installBlocker() -> String? {
         let app = Bundle.main.bundleURL
         if app.path.contains("/AppTranslocation/") {
-            return "macOS is running the app from a temporary location. Move Bin Duration Diff into your Applications folder, open it from there, then try again."
+            return "macOS is running the app from a temporary location. Move Bin Diff into your Applications folder, open it from there, then try again."
         }
         if !FileManager.default.isWritableFile(atPath: app.deletingLastPathComponent().path) {
             return "You don't have permission to replace the app in \(app.deletingLastPathComponent().path)."
@@ -155,6 +157,7 @@ final class Updater: ObservableObject {
                 case .success(let newApp):
                     self.status = "Restarting…"
                     do {
+                        self.installing = true
                         try Updater.swapAndRelaunch(newApp: newApp)
                         NSApp.terminate(nil)
                     } catch {
@@ -169,9 +172,9 @@ final class Updater: ObservableObject {
     /// Downloads and unpacks a release zip; returns the new .app after checking it.
     static func download(_ asset: GitHubRelease.Asset, _ done: @escaping (Result<URL, Error>) -> Void) {
         let work = FileManager.default.temporaryDirectory
-            .appendingPathComponent("BinDurationDiffUpdate-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("BinDiffUpdate-\(UUID().uuidString)", isDirectory: true)
         var req = URLRequest(url: URL(string: asset.browser_download_url)!)
-        req.setValue("BinDurationDiff/\(AppInfo.version)", forHTTPHeaderField: "User-Agent")
+        req.setValue("BinDiff/\(AppInfo.version)", forHTTPHeaderField: "User-Agent")
         URLSession.shared.downloadTask(with: req) { tmp, resp, err in
             done(Result {
                 if let err = err { throw err }
@@ -207,7 +210,7 @@ final class Updater: ObservableObject {
                 return app
             }
         }
-        throw EngineError.message("The download doesn't contain Bin Duration Diff.")
+        throw EngineError.message("The download doesn't contain Bin Diff.")
     }
 
     /// Starts a helper that waits for us to quit, swaps the app, and relaunches it.
@@ -230,10 +233,10 @@ final class Updater: ObservableObject {
         """
         // The temporary download folder, cleaned up afterwards (only ever our own temp folder).
         var work = newApp.deletingLastPathComponent()
-        while work.path != "/" && !work.lastPathComponent.hasPrefix("BinDurationDiffUpdate-") {
+        while work.path != "/" && !work.lastPathComponent.hasPrefix("BinDiffUpdate-") {
             work = work.deletingLastPathComponent()
         }
-        let workPath = work.lastPathComponent.hasPrefix("BinDurationDiffUpdate-") ? work.path : ""
+        let workPath = work.lastPathComponent.hasPrefix("BinDiffUpdate-") ? work.path : ""
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/sh")
         p.arguments = ["-c", script, "updater", String(pid), newApp.path, target.path, relaunch ? "1" : "0", workPath]

@@ -1,5 +1,8 @@
-// Settings: where reports go, how clips are matched, and what the report contains.
-// Everything lives in UserDefaults; Engine.swift turns it into engine arguments.
+// Settings: where reports go, which columns are compared, and what the report contains.
+//
+// Everything lives in UserDefaults under the app's bundle ID, which never changes
+// (it's still "local.bin-duration-diff" from 1.x), so settings survive quitting,
+// updating and the rename to Bin Diff. Engine.swift turns them into engine arguments.
 
 import SwiftUI
 import AppKit
@@ -12,10 +15,16 @@ enum Prefs {
     static let caseSensitive = "caseSensitiveTapes"
     static let includeSubclips = "includeSubclips"
     static let autoUpdate = "checkForUpdatesAutomatically"
+    static let ignoredColumns = "ignoredColumns"        // [String]
+    static let knownColumns = "knownColumns"            // [String]
+    static let ignoreValueCase = "ignoreValueCase"
 
+    /// ~/Documents/Bin Diff Reports -- or the 1.x folder if reports already go there.
     static var defaultReportsFolder: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Documents/Bin Duration Reports", isDirectory: true)
+        let docs = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents", isDirectory: true)
+        let old = docs.appendingPathComponent("Bin Duration Reports", isDirectory: true)
+        if FileManager.default.fileExists(atPath: old.path) { return old }
+        return docs.appendingPathComponent("Bin Diff Reports", isDirectory: true)
     }
 
     static var reportsFolderURL: URL {
@@ -28,15 +37,78 @@ enum Prefs {
     }
 }
 
+/// Which metadata columns are compared. Clips are always linked by Tape.
+final class ColumnPrefs: ObservableObject {
+    static let shared = ColumnPrefs()
+
+    /// Columns Bin Diff reads from .avb bins (named like Avid's bin columns).
+    static let builtIn = ["Name", "Duration", "Start", "End", "Tracks", "FPS", "Resolution",
+                          "Creation Date", "Modified Date"]
+    static let ignoredByDefault = ["Modified Date"]
+
+    @Published private(set) var known: [String]
+    @Published private(set) var ignored: [String]
+
+    private init() {
+        let d = UserDefaults.standard
+        known = d.stringArray(forKey: Prefs.knownColumns) ?? ColumnPrefs.builtIn
+        ignored = d.stringArray(forKey: Prefs.ignoredColumns) ?? ColumnPrefs.ignoredByDefault
+    }
+
+    func isCompared(_ c: String) -> Bool { !ignored.contains { $0.caseInsensitiveCompare(c) == .orderedSame } }
+
+    func setCompared(_ c: String, _ on: Bool) {
+        ignored.removeAll { $0.caseInsensitiveCompare(c) == .orderedSame }
+        if !on { ignored.append(c) }
+        save()
+    }
+
+    /// Remember columns seen in compared bins so they can be switched off here.
+    func remember(_ cols: [String]) {
+        var changed = false
+        for c in cols where !c.isEmpty && !known.contains(where: { $0.caseInsensitiveCompare(c) == .orderedSame }) {
+            known.append(c); changed = true
+        }
+        if changed { save() }
+    }
+
+    func add(_ c: String) {
+        let t = c.trimmingCharacters(in: .whitespaces)
+        guard !t.isEmpty, t.lowercased() != "tape" else { return }
+        remember([t])
+    }
+
+    func forgetUnused() {
+        known = ColumnPrefs.builtIn + known.filter { c in
+            !ColumnPrefs.builtIn.contains(c) && !isCompared(c)    // keep the ones switched off
+        }
+        save()
+    }
+
+    func resetToDefaults() {
+        ignored = ColumnPrefs.ignoredByDefault
+        save()
+    }
+
+    private func save() {
+        UserDefaults.standard.set(known, forKey: Prefs.knownColumns)
+        UserDefaults.standard.set(ignored, forKey: Prefs.ignoredColumns)
+    }
+}
+
 /// Report parts. Keys match bin_diff.py's --hide / --show options.
 enum ReportParts {
     static let sections: [(String, String)] = [
         ("paths", "Full bin file paths"),
         ("summary", "Summary boxes at the top"),
+        ("by_column", "Differences by column overview"),
+        ("durations", "Duration differences, ranked"),
+        ("metadata", "Metadata differences"),
+        ("columns", "Columns that weren't compared"),
         ("only_a", "Clips only in bin A"),
         ("only_b", "Clips only in bin B"),
         ("no_tape", "Clips with no tape name"),
-        ("same", "Clips with the same duration"),
+        ("same", "Clips identical in every column"),
     ]
     static let columns: [(String, String)] = [
         ("tape", "Tape"),
@@ -66,7 +138,7 @@ enum ReportParts {
 
 struct SettingsView: View {
     static func open() {
-        Windows.show("settings", title: "Bin Duration Diff Settings", size: NSSize(width: 560, height: 470)) {
+        Windows.show("settings", title: "Bin Diff Settings", size: NSSize(width: 600, height: 540)) {
             SettingsView()
         }
     }
@@ -74,11 +146,12 @@ struct SettingsView: View {
     var body: some View {
         TabView {
             GeneralSettings().tabItem { Text("General") }
+            ColumnSettings().tabItem { Text("Columns") }
             ReportSettings().tabItem { Text("Report") }
             UpdateSettings().tabItem { Text("Updates") }
         }
         .padding(16)
-        .frame(width: 560, height: 470)
+        .frame(width: 600, height: 540)
     }
 }
 
@@ -113,8 +186,8 @@ struct GeneralSettings: View {
             GroupBox(label: Text("Matching").bold()) {
                 VStack(alignment: .leading, spacing: 8) {
                     Stepper(value: $tolerance, in: 0...500) {
-                        Text(tolerance == 0 ? "Flag every difference, even 1 frame"
-                                            : "Ignore differences of \(tolerance) frame\(tolerance == 1 ? "" : "s") or less")
+                        Text(tolerance == 0 ? "Flag every duration difference, even 1 frame"
+                                            : "Ignore duration differences of \(tolerance) frame\(tolerance == 1 ? "" : "s") or less")
                     }
                     Toggle("Tape names must match upper/lower case exactly", isOn: $caseSensitive)
                     Toggle("Include subclips when a bin also has master clips", isOn: $includeSubclips)
@@ -146,6 +219,56 @@ struct GeneralSettings: View {
     }
 }
 
+struct ColumnSettings: View {
+    @ObservedObject private var cols = ColumnPrefs.shared
+    @AppStorage(Prefs.ignoreValueCase) private var ignoreValueCase = false
+    @State private var newColumn = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            (Text("Clips are always linked by ") + Text("Tape").bold()
+                + Text(". Every other column the two bins share is compared — untick any you don't care about."))
+                .fixedSize(horizontal: false, vertical: true)
+
+            GroupBox(label: Text("Compare these columns").bold()) {
+                ScrollView {
+                    LazyVGrid(columns: [GridItem(.flexible(), alignment: .leading),
+                                        GridItem(.flexible(), alignment: .leading)],
+                              alignment: .leading, spacing: 6) {
+                        ForEach(cols.known, id: \.self) { c in
+                            Toggle(c, isOn: Binding(get: { cols.isCompared(c) },
+                                                    set: { cols.setCompared(c, $0) }))
+                        }
+                    }
+                    .padding(6)
+                }
+                .frame(maxHeight: .infinity)
+            }
+
+            Text("Columns from bins you compare are added to this list automatically. Columns that appear in only one of the two bins can't be compared and are listed in the report.")
+                .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+
+            HStack {
+                TextField("Add a column by name, e.g. Camroll", text: $newColumn, onCommit: addColumn)
+                    .frame(maxWidth: 260)
+                Button("Add", action: addColumn).disabled(newColumn.trimmingCharacters(in: .whitespaces).isEmpty)
+                Spacer()
+                Menu("More") {
+                    Button("Compare all except Modified Date") { cols.resetToDefaults() }
+                    Button("Tidy list (remove columns not switched off)") { cols.forgetUnused() }
+                }
+                .frame(width: 80)
+            }
+            Toggle("Ignore upper/lower case differences in values (e.g. “Day 1” = “DAY 1”)", isOn: $ignoreValueCase)
+        }
+    }
+
+    private func addColumn() {
+        cols.add(newColumn)
+        newColumn = ""
+    }
+}
+
 struct ReportToggle: View {
     let part: String
     let label: String
@@ -172,24 +295,26 @@ struct ReportSettings: View {
                     }
                     .padding(6).frame(maxWidth: .infinity, alignment: .leading)
                 }
-                GroupBox(label: Text("Differences table columns").bold()) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Rank and Clip are always shown.").font(.caption).foregroundColor(.secondary)
-                        ForEach(ReportParts.columns, id: \.0) { ReportToggle($0.0, $0.1) }
+                VStack(spacing: 12) {
+                    GroupBox(label: Text("Duration table columns").bold()) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Rank and Clip are always shown.").font(.caption).foregroundColor(.secondary)
+                            ForEach(ReportParts.columns, id: \.0) { ReportToggle($0.0, $0.1) }
+                        }
+                        .padding(6).frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .padding(6).frame(maxWidth: .infinity, alignment: .leading)
+                    GroupBox(label: Text("Extra duration table columns").bold()) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(ReportParts.extras, id: \.0) { ReportToggle($0.0, $0.1) }
+                        }
+                        .padding(6).frame(maxWidth: .infinity, alignment: .leading)
+                    }
                 }
             }
-            GroupBox(label: Text("Extra information").bold()) {
-                VStack(alignment: .leading, spacing: 6) {
-                    ForEach(ReportParts.extras, id: \.0) { ReportToggle($0.0, $0.1) }
-                    Text("Added to every table in the report and to the CSV.")
-                        .font(.caption).foregroundColor(.secondary)
-                }
-                .padding(6).frame(maxWidth: .infinity, alignment: .leading)
-            }
+            Spacer(minLength: 0)
             HStack {
-                Text("Changes apply to the next comparison.").font(.caption).foregroundColor(.secondary)
+                Text("Which metadata columns are compared is set on the Columns tab. Changes apply to the next comparison.")
+                    .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
                 Spacer()
                 Button("Restore Defaults") { ReportParts.resetAll(); resetToken = UUID() }
             }
@@ -217,6 +342,8 @@ struct UpdateSettings: View {
                         if updater.busy { ProgressView().scaleEffect(0.5).frame(width: 16, height: 16) }
                         Text(updater.status).foregroundColor(.secondary).lineLimit(2)
                     }
+                    Text("Your settings are kept when you quit or update.")
+                        .font(.caption).foregroundColor(.secondary)
                     Link("All releases on GitHub", destination: AppInfo.repoURL.appendingPathComponent("releases"))
                 }
                 .padding(6).frame(maxWidth: .infinity, alignment: .leading)
@@ -229,6 +356,8 @@ struct UpdateSettings: View {
                 }
                 .padding(6)
             }
+            Text("Bin Diff is free software under the GNU General Public License v3.")
+                .font(.caption).foregroundColor(.secondary)
             Spacer(minLength: 0)
         }
     }

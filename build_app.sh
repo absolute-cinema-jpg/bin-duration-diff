@@ -1,18 +1,18 @@
 #!/bin/bash
-# Builds "Bin Duration Diff.app": a native Mac window (SwiftUI, mac/BinDurationDiff.swift)
-# with the comparison engine (bin_diff.py + Python + bundled pyavb) inside it.
+# Builds "Bin Diff.app": a native Mac window (SwiftUI, mac/*.swift) with the
+# comparison engine (bin_diff.py + Python + bundled pyavb) inside it.
 # Colleagues don't need Python, pip or the terminal.
 # Universal build: runs on Intel and Apple Silicon Macs (macOS 11+).
 # Needs only the Xcode Command Line Tools.
 #
-# Output: dist/Bin-Duration-Diff.zip  (app + "How to open.txt") -- share this,
+# Output: dist/Bin-Diff.zip  (app + "How to open.txt") -- share this,
 #         or publish it as a GitHub release with ./release.sh
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT="$PWD"
 
-APP="Bin Duration Diff"
-VERSION="${VERSION:-1.2.0}"   # override: VERSION=1.3.0 ./build_app.sh
+APP="Bin Diff"
+VERSION="${VERSION:-2.0.0}"   # override: VERSION=1.3.0 ./build_app.sh
 PY=/usr/bin/python3            # Apple's universal2 Python, needed for a universal engine
 VENV=build/venv
 
@@ -38,12 +38,15 @@ done
 lipo -create build/swift/app-arm64 build/swift/app-x86_64 -output build/swift/app
 
 # 3. Assemble the .app bundle
+# The bundle ID is from 1.x (when the app was "Bin Duration Diff"). Never change it:
+# settings are stored under it, and the updater only installs an app with this ID.
+BUNDLE_ID="local.bin-duration-diff"
 BUNDLE="dist/$APP.app"
-rm -rf "$BUNDLE"
+rm -rf "$BUNDLE" "dist/Bin Duration Diff.app"
 mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
 cp build/swift/app "$BUNDLE/Contents/MacOS/$APP"
 cp -R build/engine/bin_diff_engine "$BUNDLE/Contents/Resources/engine"
-cp vendor/avb/LICENSE-pyavb.txt "$BUNDLE/Contents/Resources/"
+cp vendor/avb/LICENSE-pyavb.txt LICENSE "$BUNDLE/Contents/Resources/"
 cp mac/AppIcon.icns "$BUNDLE/Contents/Resources/AppIcon.icns"
 cat > "$BUNDLE/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -53,8 +56,8 @@ cat > "$BUNDLE/Contents/Info.plist" <<EOF
   <key>CFBundleDisplayName</key><string>$APP</string>
   <key>CFBundleExecutable</key><string>$APP</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
-  <key>NSHumanReadableCopyright</key><string>by Alex Stuart</string>
-  <key>CFBundleIdentifier</key><string>local.bin-duration-diff</string>
+  <key>NSHumanReadableCopyright</key><string>by Alex Stuart · GNU GPL v3</string>
+  <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>$VERSION</string>
@@ -69,45 +72,9 @@ codesign --force --deep --sign - "$BUNDLE"    # ad hoc signature (not notarized)
 SHARE="build/share"
 rm -rf "$SHARE" && mkdir -p "$SHARE"
 cp -R "$BUNDLE" "$SHARE/"
-cat > "$SHARE/How to open.txt" <<'EOF'
-BIN DURATION DIFF
-Compares clip durations between two Avid bins. Clips are matched by tape name.
-
-FIRST TIME ONLY
-The app isn't from the App Store, so macOS blocks it the first time:
-  1. Drag "Bin Duration Diff" into your Applications folder (optional).
-  2. Double-click it. macOS will say it can't be opened. Click Done or OK.
-  3. Open System Settings > Privacy & Security, scroll down, and click
-     "Open Anyway" next to "Bin Duration Diff". Confirm with your password.
-     (On macOS 13 or 14 you can instead right-click the app > Open > Open.)
-After that it opens normally with a double-click.
-
-USING IT
-  1. Double-click the app. One window opens with Bin A and Bin B side by side.
-  2. Click Choose... on each side, or drag the .avb bin files in from Finder
-     (drag both at once to fill A and B together; the arrows button swaps them).
-  3. Click Compare. The report opens in your web browser: every clip whose
-     duration differs between the bins, biggest difference first.
-  The window stays open, so you can compare another pair straight away.
-
-SETTINGS (gear button, or Bin Duration Diff > Settings...)
-  Where reports are saved, which sections and columns appear in the report,
-  extra information (start timecode, frame counts, frame rate), and matching
-  options such as ignoring differences of a frame or two.
-
-UPDATES
-  The app checks for a new version once a day and offers to install it.
-  You can also use Bin Duration Diff > Check for Updates...
-  For updates to install themselves, keep the app in your Applications folder.
-
-PROBLEMS?
-  Use the "Report a Bug..." button. It opens a ready-to-send GitHub issue
-  (needs a free GitHub account).
-
-Reports are saved in Documents > Bin Duration Reports (HTML + a CSV for Excel).
-EOF
-ZIP="dist/Bin-Duration-Diff.zip"
-rm -f "$ZIP" "dist/$APP.zip"
+cp mac/How-to-open.txt "$SHARE/How to open.txt"
+ZIP="dist/Bin-Diff.zip"
+rm -f dist/*.zip
 ditto -c -k --sequesterRsrc "$SHARE" "$ZIP"
 
 echo

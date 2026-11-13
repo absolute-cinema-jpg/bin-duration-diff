@@ -1,0 +1,40 @@
+BIN DIFF
+Compares two Avid bins. Clips are linked by their Tape name, and every other
+column (Name, Duration, Start, End, Tracks, Scene, Take, Comments, ...) is
+compared. Duration differences are also ranked, biggest first.
+
+FIRST TIME ONLY
+The app isn't from the App Store, so macOS blocks it the first time:
+  1. Drag "Bin Diff" into your Applications folder.
+  2. Double-click it. macOS will say it can't be opened. Click Done or OK.
+  3. Open System Settings > Privacy & Security, scroll down, and click
+     "Open Anyway" next to "Bin Diff". Confirm with your password.
+     (On macOS 13 or 14 you can instead right-click the app > Open > Open.)
+After that it opens normally with a double-click.
+
+USING IT
+  1. Double-click the app. One window opens with Bin A and Bin B side by side.
+  2. Click Choose... on each side, or drag the .avb bin files in from Finder
+     (drag both at once to fill A and B together; the arrows button swaps them).
+  3. Click Compare. The report opens in your web browser.
+  The window stays open, so you can compare another pair straight away.
+
+SETTINGS (gear button, or Bin Diff > Settings...)
+  Columns: which columns are compared (new columns are added as you compare bins).
+  Report:  which sections appear, and the duration table's columns.
+  General: where reports are saved, and duration/tape matching options.
+  Your settings are kept when you quit or update.
+
+UPDATES
+  The app checks for a new version once a day and offers to install it.
+  You can also use Bin Diff > Check for Updates...
+  For updates to install themselves, keep the app in your Applications folder.
+
+PROBLEMS?
+  Use the "Report a Bug..." button. It opens a ready-to-send GitHub issue
+  (needs a free GitHub account).
+
+Reports are saved in Documents > Bin Diff Reports (HTML + a CSV for Excel).
+
+Bin Diff by Alex Stuart. Free software under the GNU GPL v3:
+https://github.com/absolute-cinema-jpg/bin-diff

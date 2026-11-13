@@ -98,7 +98,7 @@ struct BugReportView: View {
         let exp = expected.trimmingCharacters(in: .whitespacesAndNewlines)
         if !exp.isEmpty { body += "\n### What I expected\n\(exp)\n" }
         if includeDetails { body += "\n### Technical details\n```\n\(details)\n```\n" }
-        body += "\n_Sent from Bin Duration Diff's Report a Bug window._"
+        body += "\n_Sent from Bin Diff's Report a Bug window._"
         NSWorkspace.shared.open(BugReportView.issueURL(title: title, body: body))
         Windows.close("bug")
     }

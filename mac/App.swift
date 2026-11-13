@@ -1,11 +1,11 @@
-// Bin Duration Diff -- native Mac front end for bin_diff.py.
+// Bin Diff -- native Mac front end for bin_diff.py.
 // App entry point, menus, shared state and small helpers.
 
 import SwiftUI
 import AppKit
 
 enum AppInfo {
-    static let repo = "absolute-cinema-jpg/bin-duration-diff"
+    static let repo = "absolute-cinema-jpg/bin-diff"
     static let repoURL = URL(string: "https://github.com/\(repo)")!
     static var version: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
@@ -15,7 +15,7 @@ enum AppInfo {
 #if !SNAPSHOT
 @main
 #endif
-struct BinDurationDiffApp: App {
+struct BinDiffApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
@@ -33,7 +33,7 @@ struct BinDurationDiffApp: App {
             }
             CommandGroup(replacing: .help) {
                 Button("Report a Bug…") { BugReportView.open() }
-                Button("Bin Duration Diff on GitHub") { NSWorkspace.shared.open(AppInfo.repoURL) }
+                Button("Bin Diff on GitHub") { NSWorkspace.shared.open(AppInfo.repoURL) }
             }
         }
     }
@@ -41,6 +41,19 @@ struct BinDurationDiffApp: App {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    /// Copies updated from 1.x keep the old "Bin Duration Diff.app" file name; tidy it to
+    /// "Bin Diff.app" on a normal quit (never while an update is being swapped in).
+    func applicationWillTerminate(_ notification: Notification) {
+        guard !Updater.shared.installing else { return }
+        let app = Bundle.main.bundleURL
+        guard app.lastPathComponent == "Bin Duration Diff.app",
+              !app.path.contains("/AppTranslocation/") else { return }
+        let target = app.deletingLastPathComponent().appendingPathComponent("Bin Diff.app")
+        guard !FileManager.default.fileExists(atPath: target.path),
+              FileManager.default.isWritableFile(atPath: app.deletingLastPathComponent().path) else { return }
+        try? FileManager.default.moveItem(at: app, to: target)
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) {

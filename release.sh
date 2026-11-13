@@ -22,8 +22,8 @@ fi
 
 VERSION="$VERSION" ./build_app.sh
 git push origin HEAD
-gh release create "$TAG" dist/Bin-Duration-Diff.zip \
+gh release create "$TAG" dist/Bin-Diff.zip \
   --target "$(git rev-parse HEAD)" \
-  --title "Bin Duration Diff $VERSION" \
-  --notes "${NOTES:-Bin Duration Diff $VERSION}"
+  --title "Bin Diff $VERSION" \
+  --notes "${NOTES:-Bin Diff $VERSION}"
 echo "Released $TAG"

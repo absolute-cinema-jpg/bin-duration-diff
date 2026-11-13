@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """
-bin_diff.py - compare clip durations between two Avid bins.
+bin_diff.py - compare two Avid bins and report every difference.
 
-Clips are matched by TAPE NAME. Every matched pair whose durations differ is
-flagged, and the differences are ranked biggest-first in an HTML report
-(plus a CSV with the same rows).
+Clips are linked by TAPE NAME. For each pair of linked clips, every other
+metadata column the two bins share is compared (Name, Duration, Start, End,
+Tracks, FPS, user columns such as Scene / Take / Comments, ...). Duration
+differences are also ranked biggest-first. Output: an HTML report plus a CSV.
 
 Accepted inputs (each side can be any of these):
   * .avb   Avid bin, read directly (pyavb is bundled in ./vendor)
   * .ale   Avid Log Exchange export
   * .txt / .tab / .tsv / .csv   Bin export (File > Export > Tab Delimited).
-           Needs a Tape column and a Duration column (or Start + End).
+           Needs a Tape column. Every other column is compared.
 
 Usage:
   python3 bin_diff.py BIN_A BIN_B [-o report.html] [--fps 23.976]
-                      [--tolerance 0] [--include-subclips] [--open]
+                      [--tolerance 0] [--ignore-columns "Modified Date,Comments"]
+                      [--include-subclips] [--open]
+
+Copyright (C) 2026 Alex Stuart. Licensed under the GNU GPL v3 (see LICENSE).
 """
 
 from __future__ import annotations
@@ -38,6 +42,8 @@ _VENDOR = os.path.join(_HERE, "vendor")
 if os.path.isdir(_VENDOR) and _VENDOR not in sys.path:
     sys.path.insert(0, _VENDOR)
 
+APP_NAME = "Bin Diff"
+
 
 # --------------------------------------------------------------------------- #
 # Timecode helpers
@@ -45,10 +51,6 @@ if os.path.isdir(_VENDOR) and _VENDOR not in sys.path:
 
 def nominal_fps(fps: float) -> int:
     return int(round(fps))
-
-
-def is_drop_rate(fps: float) -> bool:
-    return abs(fps - 29.97) < 0.01 or abs(fps - 59.94) < 0.01
 
 
 def tc_to_frames(tc: str, fps: float) -> Optional[int]:
@@ -106,6 +108,10 @@ def fmt_fps(fps: float) -> str:
     return ("%.3f" % fps).rstrip("0").rstrip(".")
 
 
+def signed_tc(d: int, fps: float) -> str:
+    return ("+" if d > 0 else "") + frames_to_tc(d, fps)
+
+
 # --------------------------------------------------------------------------- #
 # Clip model
 # --------------------------------------------------------------------------- #
@@ -119,16 +125,37 @@ class Clip:
     kind: str = "clip"             # master / subclip / clip
     raw_duration: str = ""
     start_tc: str = ""             # source start timecode, when known
+    meta: "OrderedDict[str, str]" = field(default_factory=OrderedDict)  # column -> value (not Tape)
+
+    def value(self, column: str) -> str:
+        """Value of a column, matched without regard to case."""
+        v = self.meta.get(column)
+        if v is None:
+            low = column.lower()
+            v = next((val for k, val in self.meta.items() if k.lower() == low), "")
+        return v or ""
 
 
 @dataclass
 class Bin:
     path: str
     clips: List[Clip] = field(default_factory=list)
+    columns: List[str] = field(default_factory=list)   # metadata columns found (not Tape)
 
     @property
     def label(self) -> str:
         return os.path.basename(self.path)
+
+    def add_columns(self, names):
+        have = {c.lower() for c in self.columns}
+        for n in names:
+            if n and n.lower() not in have:
+                self.columns.append(n)
+                have.add(n.lower())
+
+
+def dur_tc(c: Clip) -> str:
+    return frames_to_tc(c.frames, c.fps) if c.frames is not None else (c.raw_duration or "")
 
 
 # --------------------------------------------------------------------------- #
@@ -177,6 +204,7 @@ def parse_fps(value: str) -> Optional[float]:
 
 def rows_to_bin(path: str, header: List[str], rows: List[List[str]], fps: float, args) -> Bin:
     b = Bin(path)
+    header = [h.strip() for h in header]
     i_tape = _find_col(header, TAPE_COLS, args.tape_column)
     i_name = _find_col(header, NAME_COLS)
     i_dur = _find_col(header, DUR_COLS, args.duration_column)
@@ -187,10 +215,17 @@ def rows_to_bin(path: str, header: List[str], rows: List[List[str]], fps: float,
     if i_tape is None:
         raise SystemExit("%s: no Tape column found. Columns are: %s\n"
                          "Add the Tape column to the bin view before exporting, "
-                         "or pass --tape-column." % (path, ", ".join(header)))
-    if i_dur is None and (i_start is None or i_end is None):
-        raise SystemExit("%s: no Duration column (or Start + End) found. Columns are: %s"
-                         % (path, ", ".join(header)))
+                         "or pass --tape-column." % (os.path.basename(path), ", ".join(header)))
+
+    # Every column except Tape is metadata to compare (first occurrence of each name).
+    meta_cols = []
+    seen = set()
+    for i, h in enumerate(header):
+        if i == i_tape or not h or h.lower() in seen:
+            continue
+        seen.add(h.lower())
+        meta_cols.append((i, h))
+    b.add_columns([h for _, h in meta_cols])
 
     def cell(row, i):
         return row[i].strip() if i is not None and i < len(row) else ""
@@ -206,8 +241,10 @@ def rows_to_bin(path: str, header: List[str], rows: List[List[str]], fps: float,
             if s is not None and e is not None:
                 frames = e - s
                 raw = raw or "%s - %s" % (cell(row, i_start), cell(row, i_end))
+        meta = OrderedDict((h, cell(row, i)) for i, h in meta_cols)
         b.clips.append(Clip(name=cell(row, i_name) or "(unnamed)", tape=cell(row, i_tape),
-                            frames=frames, fps=row_fps, raw_duration=raw, start_tc=cell(row, i_start)))
+                            frames=frames, fps=row_fps, raw_duration=raw,
+                            start_tc=cell(row, i_start), meta=meta))
     return b
 
 
@@ -219,7 +256,7 @@ def read_delimited(path: str, args) -> Bin:
     rows = list(csv.reader(lines, delimiter=delim))
     rows = [r for r in rows if any(c.strip() for c in r)]
     if not rows:
-        raise SystemExit("%s: file is empty" % path)
+        raise SystemExit("%s: file is empty" % os.path.basename(path))
     return rows_to_bin(path, rows[0], rows[1:], args.fps, args)
 
 
@@ -242,8 +279,23 @@ def read_ale(path: str, args) -> Bin:
         elif section == "data":
             rows.append(line.split("\t"))
     if header is None:
-        raise SystemExit("%s: doesn't look like an ALE (no Column section)" % path)
+        raise SystemExit("%s: doesn't look like an ALE (no Column section)" % os.path.basename(path))
     return rows_to_bin(path, header, rows, fps or args.fps, args)
+
+
+# Columns read from .avb bins (named like Avid's bin columns), then any user columns.
+AVB_COLUMNS = ["Name", "Duration", "Start", "End", "Tracks", "FPS", "Resolution",
+               "Creation Date", "Modified Date"]
+
+
+def _fmt_value(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, _dt.datetime):
+        return v.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(v, (bytes, bytearray)):
+        return ""
+    return str(v).strip()
 
 
 def read_avb(path: str, args) -> Bin:
@@ -254,6 +306,7 @@ def read_avb(path: str, args) -> Bin:
                          "Export the bin from Avid as Tab Delimited / ALE and use that instead.")
 
     b = Bin(path)
+    b.add_columns(AVB_COLUMNS)
 
     def comp_rate(comp) -> Optional[float]:
         r = getattr(comp, "edit_rate", None)
@@ -262,15 +315,15 @@ def read_avb(path: str, args) -> Bin:
         except (TypeError, ValueError):
             return None
 
+    def media_kind(t):
+        try:
+            return t.component.media_kind
+        except Exception:
+            return None
+
     def ordered_tracks(mob):
         tracks = list(getattr(mob, "tracks", []) or [])
-        def key(t):
-            try:
-                mk = t.component.media_kind
-            except Exception:
-                mk = None
-            return {"picture": 0, "sound": 1}.get(mk, 2)
-        return sorted(tracks, key=key)
+        return sorted(tracks, key=lambda t: {"picture": 0, "sound": 1}.get(media_kind(t), 2))
 
     def walk_clips(comp, depth=0):
         """Yield SourceClips found inside a component tree."""
@@ -294,23 +347,30 @@ def read_avb(path: str, args) -> Bin:
                     return c
         return None
 
-    def find_source(mob, offset=0, depth=0, seen=None) -> Tuple[Optional[str], str]:
-        """Follow a clip back to its tape. Returns (tape name, start timecode)."""
+    def find_source(mob, offset=0, depth=0, seen=None):
+        """Follow a clip back to its tape.
+        Returns (tape name, (start frames, tc base, drop) or None, resolution)."""
         seen = seen if seen is not None else set()
         if mob is None or depth > 8 or id(mob) in seen:
-            return None, ""
+            return None, None, ""
         seen.add(id(mob))
         desc = getattr(mob, "descriptor", None)
+        res = ""
+        try:
+            w, h = getattr(desc, "stored_width", None), getattr(desc, "stored_height", None)
+            if w and h:
+                res = "%dx%d" % (int(w), int(h))
+        except Exception:
+            res = ""
         if desc is not None and type(desc).__name__ == "TapeDescriptor":
-            start = ""
+            start = None
             tc = timecode_of(mob)
             try:
                 if tc is not None and int(tc.fps or 0) > 0:
-                    start = frames_to_clock_tc(int(tc.start or 0) + offset, int(tc.fps),
-                                               bool(int(tc.flags or 0) & 1))
+                    start = (int(tc.start or 0) + offset, int(tc.fps), bool(int(tc.flags or 0) & 1))
             except Exception:
-                start = ""
-            return mob.name, start
+                start = None
+            return mob.name, start, res
         for t in ordered_tracks(mob):
             for sc in walk_clips(t.component):
                 try:
@@ -318,22 +378,59 @@ def read_avb(path: str, args) -> Bin:
                     sc_start = int(getattr(sc, "start_time", 0) or 0)
                 except Exception:
                     ref, sc_start = None, 0
-                tape, start = find_source(ref, offset + sc_start, depth + 1, seen)
+                tape, start, sub_res = find_source(ref, offset + sc_start, depth + 1, seen)
                 if tape:
-                    return tape, start
-        return None, ""
+                    return tape, start, res or sub_res
+        return None, None, res
 
     def mob_rate(mob) -> Optional[float]:
         for t in ordered_tracks(mob):
-            try:
-                if t.component.media_kind == "timecode":
-                    continue
-            except Exception:
-                pass
+            if media_kind(t) == "timecode":
+                continue
             r = comp_rate(getattr(t, "component", None))
             if r:
                 return r
         return None
+
+    def tracks_label(mob) -> str:
+        kinds = [media_kind(t) for t in getattr(mob, "tracks", []) or []]
+        parts = []
+        for kind, letter in (("picture", "V"), ("sound", "A")):
+            n = kinds.count(kind)
+            if n == 1:
+                parts.append("%s1" % letter)
+            elif n > 1:
+                parts.append("%s1-%d" % (letter, n))
+        return " ".join(parts)
+
+    def user_columns(mob) -> "OrderedDict[str, str]":
+        """Avid keeps bin columns like Scene, Take, Comments in the clip's attributes
+        (the "_USER" list); other non-internal attributes are included too."""
+        out = OrderedDict()
+        try:
+            attrs = mob.attributes
+        except Exception:
+            attrs = None
+        if not attrs:
+            return out
+        try:
+            items = list(attrs.items())
+        except Exception:
+            return out
+        for key, val in items:
+            if key == "_USER":
+                try:
+                    for k, v in val.items():
+                        s = _fmt_value(v)
+                        if k and not str(k).startswith("_"):
+                            out[str(k)] = s
+                except Exception:
+                    pass
+            elif not str(key).startswith("_"):
+                s = _fmt_value(val)
+                if isinstance(val, (str, int)):
+                    out[str(key)] = s
+        return out
 
     with avb.open(path) as f:
         items = list(f.content.items)
@@ -366,10 +463,30 @@ def read_avb(path: str, args) -> Bin:
                 length = int(mob.length)
             except Exception:
                 length = None
-            tape, start = find_source(mob)
+            tape, start, res = find_source(mob)
+            start_s = end_s = ""
+            if start:
+                sf, base, drop = start
+                start_s = frames_to_clock_tc(sf, base, drop)
+                if length is not None:
+                    end_s = frames_to_clock_tc(sf + length, base, drop)
+            meta = OrderedDict([
+                ("Name", mob.name or ""),
+                ("Duration", frames_to_tc(length, rate) if length is not None else ""),
+                ("Start", start_s),
+                ("End", end_s),
+                ("Tracks", tracks_label(mob)),
+                ("FPS", fmt_fps(rate)),
+                ("Resolution", res),
+                ("Creation Date", _fmt_value(getattr(mob, "creation_time", None))),
+                ("Modified Date", _fmt_value(getattr(mob, "last_modified", None))),
+            ])
+            user = user_columns(mob)
+            b.add_columns(user.keys())
+            meta.update(user)
             b.clips.append(Clip(name=mob.name or "(unnamed)", tape=tape or "", frames=length,
-                                fps=rate, kind=kind, start_tc=start,
-                                raw_duration=frames_to_tc(length, rate) if length is not None else ""))
+                                fps=rate, kind=kind, start_tc=start_s, meta=meta,
+                                raw_duration=meta["Duration"]))
     return b
 
 
@@ -378,17 +495,10 @@ def select_clip_kinds(b: Bin, include_subclips: bool) -> Bin:
     master clips at all (e.g. an AutoSync bin full of sync subclips)."""
     masters = [c for c in b.clips if c.kind != "subclip"]
     subs = [c for c in b.clips if c.kind == "subclip"]
-    if not subs or include_subclips:
-        return b
-    if not masters:
+    if not subs or include_subclips or not masters:
         return b
     b.clips = masters
     return b
-
-
-def bin_kind_counts(b: Bin) -> Tuple[int, int]:
-    subs = sum(1 for c in b.clips if c.kind == "subclip")
-    return len(b.clips) - subs, subs
 
 
 def load_bin(path: str, args, filter_kinds: bool = True) -> Bin:
@@ -411,11 +521,21 @@ def load_bin(path: str, args, filter_kinds: bool = True) -> Bin:
 # --------------------------------------------------------------------------- #
 
 @dataclass
+class MetaDiff:
+    pair: "Pair"
+    column: str
+    a: str
+    b: str
+
+
+@dataclass
 class Pair:
     tape: str
     a: Clip
     b: Clip
     note: str = ""
+    meta_diffs: List[MetaDiff] = field(default_factory=list)
+    duration_flagged: bool = False
 
     @property
     def diff(self) -> Optional[int]:
@@ -425,8 +545,11 @@ class Pair:
 
     @property
     def abs_seconds(self) -> float:
-        d = self.diff or 0
-        return abs(d) / (self.a.fps or 24)
+        return abs(self.diff or 0) / (self.a.fps or 24)
+
+    @property
+    def has_differences(self) -> bool:
+        return self.duration_flagged or bool(self.meta_diffs)
 
 
 @dataclass
@@ -440,19 +563,45 @@ class Result:
     no_tape_b: List[Clip]
     dup_tapes: Dict[str, Tuple[int, int]]
     tolerance: int
+    compared_columns: List[str]       # metadata columns compared (not Duration)
+    compare_duration: bool
+    columns_only_a: List[str]
+    columns_only_b: List[str]
+    ignored_columns: List[str]        # present in the bins but turned off
 
     @property
     def flagged(self) -> List[Pair]:
-        out = [p for p in self.pairs if p.diff is not None and abs(p.diff) > self.tolerance]
+        """Duration differences, biggest first."""
+        out = [p for p in self.pairs if p.duration_flagged]
         return sorted(out, key=lambda p: (-abs(p.diff), p.tape.lower()))
 
     @property
+    def meta_diffs(self) -> List[MetaDiff]:
+        order = {c.lower(): i for i, c in enumerate(self.compared_columns)}
+        out = [d for p in self.pairs for d in p.meta_diffs]
+        return sorted(out, key=lambda d: (order.get(d.column.lower(), 999), d.pair.a.name.lower()))
+
+    @property
     def unknown(self) -> List[Pair]:
-        return [p for p in self.pairs if p.diff is None]
+        return [p for p in self.pairs if p.diff is None] if self.compare_duration else []
 
     @property
     def matching(self) -> List[Pair]:
-        return [p for p in self.pairs if p.diff is not None and abs(p.diff) <= self.tolerance]
+        return [p for p in self.pairs if not p.has_differences]
+
+    @property
+    def changed(self) -> List[Pair]:
+        return [p for p in self.pairs if p.has_differences]
+
+    def column_counts(self) -> "OrderedDict[str, int]":
+        counts = OrderedDict()
+        if self.compare_duration:
+            counts["Duration"] = len(self.flagged)
+        for c in self.compared_columns:
+            counts[c] = 0
+        for d in (d for p in self.pairs for d in p.meta_diffs):
+            counts[d.column] = counts.get(d.column, 0) + 1
+        return counts
 
 
 def tape_key(tape: str, case_sensitive: bool) -> str:
@@ -471,7 +620,14 @@ def group(clips: List[Clip], case_sensitive: bool):
     return groups, no_tape
 
 
-def compare(a: Bin, b: Bin, tolerance: int, case_sensitive: bool) -> Result:
+def _norm(v: str, ignore_case: bool) -> str:
+    v = " ".join((v or "").split())
+    return v.lower() if ignore_case else v
+
+
+def compare(a: Bin, b: Bin, tolerance: int = 0, case_sensitive: bool = False,
+            ignore_columns: Optional[Set[str]] = None, ignore_value_case: bool = False) -> Result:
+    ignore = {c.strip().lower() for c in (ignore_columns or set()) if c.strip()}
     ga, nta = group(a.clips, case_sensitive)
     gb, ntb = group(b.clips, case_sensitive)
     pairs, only_a, only_b, dups = [], [], [], {}
@@ -493,17 +649,37 @@ def compare(a: Bin, b: Bin, tolerance: int, case_sensitive: bool) -> Result:
         only_a.extend(la[len(lb):])
         only_b.extend(lb[len(la):])
 
-    return Result(a, b, pairs, only_a, only_b, nta, ntb, dups, tolerance)
+    cols_b = {c.lower() for c in b.columns}
+    cols_a = {c.lower() for c in a.columns}
+    shared = [c for c in a.columns if c.lower() in cols_b]
+    compare_duration = "duration" not in ignore
+    compared = [c for c in shared if c.lower() not in ignore and c.lower() != "duration"]
+    ignored = [c for c in shared if c.lower() in ignore]
+
+    for p in pairs:
+        d = p.diff
+        p.duration_flagged = compare_duration and d is not None and abs(d) > tolerance
+        for col in compared:
+            va, vb = p.a.value(col), p.b.value(col)
+            if _norm(va, ignore_value_case) != _norm(vb, ignore_value_case):
+                p.meta_diffs.append(MetaDiff(p, col, va, vb))
+
+    return Result(a, b, pairs, only_a, only_b, nta, ntb, dups, tolerance,
+                  compared, compare_duration,
+                  [c for c in a.columns if c.lower() not in cols_b],
+                  [c for c in b.columns if c.lower() not in cols_a],
+                  ignored)
 
 
 # --------------------------------------------------------------------------- #
 # Report options
 # --------------------------------------------------------------------------- #
 
-# Shown by default (turn off with --hide): sections, then ranked-table columns.
-SECTIONS = ["paths", "summary", "only_a", "only_b", "no_tape", "same"]
+# Shown by default (turn off with --hide): sections, then duration-table columns.
+SECTIONS = ["paths", "summary", "by_column", "durations", "metadata", "columns",
+            "only_a", "only_b", "no_tape", "same"]
 COLUMNS = ["tape", "dur_a", "dur_b", "diff_tc", "diff_frames", "diff_sec", "direction", "magnitude"]
-# Off by default (turn on with --show).
+# Off by default (turn on with --show): extra duration-table columns.
 EXTRAS = ["start_tc", "frames", "fps"]
 REPORT_KEYS = SECTIONS + COLUMNS + EXTRAS
 
@@ -526,73 +702,55 @@ def parse_keys(s: Optional[str]) -> Set[str]:
     return keys
 
 
-def signed_tc(d: int, fps: float) -> str:
-    return ("+" if d > 0 else "") + frames_to_tc(d, fps)
-
-
-def dur_tc(c: Clip) -> str:
-    return frames_to_tc(c.frames, c.fps) if c.frames is not None else (c.raw_duration or "")
+def split_list(s: Optional[str]) -> Set[str]:
+    return {k.strip() for k in (s or "").split(",") if k.strip()}
 
 
 # --------------------------------------------------------------------------- #
-# Output
+# CSV: one row per difference, then unmatched clips
 # --------------------------------------------------------------------------- #
 
-def _csv_headers(opts: ReportOptions) -> List[str]:
-    h = ["Rank", "Clip (A)", "Clip (B)"]
-    if opts.on("tape"): h.append("Tape")
-    if opts.on("dur_a"): h.append("Duration A")
-    if opts.on("dur_b"): h.append("Duration B")
-    if opts.on("start_tc"): h += ["Start A", "Start B"]
-    if opts.on("frames"): h += ["Frames A", "Frames B"]
-    if opts.on("fps"): h.append("FPS")
-    if opts.on("diff_tc"): h.append("Diff (TC)")
-    if opts.on("diff_frames"): h.append("Diff (frames)")
-    if opts.on("diff_sec"): h.append("Diff (sec)")
-    return h + ["Status", "Note"]
-
-
-def _pair_values(p: "Pair", rank) -> dict:
-    d = p.diff
-    v = {"Rank": rank, "Clip (A)": p.a.name, "Clip (B)": p.b.name, "Tape": p.tape,
-         "Duration A": dur_tc(p.a), "Duration B": dur_tc(p.b),
-         "Start A": p.a.start_tc, "Start B": p.b.start_tc,
-         "Frames A": p.a.frames, "Frames B": p.b.frames, "FPS": fmt_fps(p.a.fps), "Note": p.note}
-    if d is not None:
-        v.update({"Diff (TC)": signed_tc(d, p.a.fps), "Diff (frames)": d,
-                  "Diff (sec)": "%.3f" % (d / (p.a.fps or 24)),
-                  "Status": "same duration" if d == 0 else ("B longer" if d > 0 else "B shorter")})
-    return v
-
-
-def _clip_values(c: Clip, side: str, status: str) -> dict:
-    return {"Clip (%s)" % side: c.name, "Tape": c.tape, "Duration %s" % side: dur_tc(c),
-            "Start %s" % side: c.start_tc, "Frames %s" % side: c.frames, "FPS": fmt_fps(c.fps),
-            "Status": status}
+CSV_HEADERS = ["Clip (A)", "Clip (B)", "Tape", "Column", "Bin A", "Bin B", "Difference", "Status", "Note"]
 
 
 def write_csv(res: Result, path: str, opts: ReportOptions = None):
     opts = opts or ReportOptions()
-    headers = _csv_headers(opts)
-    rows = [_pair_values(p, i) for i, p in enumerate(res.flagged, 1)]
-    if opts.on("only_a"): rows += [_clip_values(c, "A", "only in A") for c in res.only_a]
-    if opts.on("only_b"): rows += [_clip_values(c, "B", "only in B") for c in res.only_b]
+    rows = []
+    if opts.on("durations"):
+        for p in res.flagged:
+            rows.append([p.a.name, p.b.name, p.tape, "Duration", dur_tc(p.a), dur_tc(p.b),
+                         "%s (%+d fr)" % (signed_tc(p.diff, p.a.fps), p.diff),
+                         "B longer" if p.diff > 0 else "B shorter", p.note])
+    if opts.on("metadata"):
+        for d in res.meta_diffs:
+            p = d.pair
+            rows.append([p.a.name, p.b.name, p.tape, d.column, d.a, d.b, "", "different", p.note])
+    if opts.on("only_a"):
+        rows += [[c.name, "", c.tape, "", "", "", "", "only in A", ""] for c in res.only_a]
+    if opts.on("only_b"):
+        rows += [["", c.name, c.tape, "", "", "", "", "only in B", ""] for c in res.only_b]
     if opts.on("no_tape"):
-        rows += [_clip_values(c, "A", "no tape name") for c in res.no_tape_a]
-        rows += [_clip_values(c, "B", "no tape name") for c in res.no_tape_b]
-    if opts.on("same"): rows += [_pair_values(p, "") for p in res.matching]
+        rows += [[c.name, "", "", "", "", "", "", "no tape name (A)", ""] for c in res.no_tape_a]
+        rows += [["", c.name, "", "", "", "", "", "no tape name (B)", ""] for c in res.no_tape_b]
+    if opts.on("same"):
+        rows += [[p.a.name, p.b.name, p.tape, "", "", "", "", "identical", p.note] for p in res.matching]
     with open(path, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
-        w.writerow(headers)
-        for r in rows:
-            w.writerow(["" if r.get(h) is None else r.get(h, "") for h in headers])
+        w.writerow(CSV_HEADERS)
+        w.writerows(rows)
 
+
+# --------------------------------------------------------------------------- #
+# HTML report
+# --------------------------------------------------------------------------- #
 
 CSS = """
 :root{--bg:#f6f6f4;--panel:#fff;--ink:#1d1d1f;--muted:#6b6b70;--line:#e3e3df;
---accent:#2f5bd3;--long:#b4541a;--short:#2a7a5a;--bar:#dfe6fb;--warn:#8a6a00;--warnbg:#fff6d9}
+--accent:#2f5bd3;--long:#b4541a;--short:#2a7a5a;--bar:#dfe6fb;--warn:#8a6a00;--warnbg:#fff6d9;
+--olda:#f9e2dc;--newb:#dcefe4}
 @media (prefers-color-scheme:dark){:root{--bg:#141416;--panel:#1d1d20;--ink:#ececee;--muted:#9a9aa2;
---line:#2e2e33;--accent:#7d9bff;--long:#f0965a;--short:#5fcf9f;--bar:#2a3352;--warn:#e9c75a;--warnbg:#2e2914}}
+--line:#2e2e33;--accent:#7d9bff;--long:#f0965a;--short:#5fcf9f;--bar:#2a3352;--warn:#e9c75a;--warnbg:#2e2914;
+--olda:#3a2420;--newb:#1d3327}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
 main{max-width:1200px;margin:0 auto;padding:28px 16px 60px}
@@ -609,6 +767,7 @@ h1{font-size:22px;margin:0 0 4px}h2{font-size:16px;margin:32px 0 10px}
 .wrap{overflow-x:auto;background:var(--panel);border:1px solid var(--line);border-radius:10px}
 table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
 th,td{padding:7px 10px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
+td.wrapcell{white-space:normal;min-width:160px;max-width:420px;overflow-wrap:anywhere}
 th{font-size:12px;color:var(--muted);font-weight:600;position:sticky;top:0;background:var(--panel);cursor:pointer;user-select:none}
 tr:last-child td{border-bottom:0}
 td.num,th.num{text-align:right}
@@ -618,8 +777,11 @@ td.num,th.num{text-align:right}
 .bar{height:8px;border-radius:4px;background:var(--accent);opacity:.8}
 .note{color:var(--warn);font-size:12px}
 .muted{color:var(--muted)}
+.va{background:var(--olda)}.vb{background:var(--newb)}
 .warnbox{background:var(--warnbg);color:var(--warn);border-radius:8px;padding:10px 12px;margin-top:12px}
 .empty{padding:16px;color:var(--muted)}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:3px 10px;font-size:13px}
 details{margin-top:8px}summary{cursor:pointer;color:var(--muted)}
 footer{margin-top:48px;color:var(--muted);font-size:11px;opacity:.7}
 .filter{margin:0 0 10px;padding:7px 10px;width:100%;max-width:320px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--ink)}
@@ -632,8 +794,8 @@ document.querySelectorAll('table.sortable').forEach(function(t){
     rows.sort(function(x,y){var a=x.cells[i].dataset.v||x.cells[i].textContent,c=y.cells[i].dataset.v||y.cells[i].textContent;
       var na=parseFloat(a),nc=parseFloat(c);if(!isNaN(na)&&!isNaN(nc))return asc?na-nc:nc-na;return asc?a.localeCompare(c):c.localeCompare(a)});
     rows.forEach(function(r){b.appendChild(r)});});});});
-var f=document.getElementById('filter');if(f)f.addEventListener('input',function(){var q=f.value.toLowerCase();
-  document.querySelectorAll('#ranked tbody tr').forEach(function(r){r.style.display=r.textContent.toLowerCase().indexOf(q)>-1?'':'none'})});
+document.querySelectorAll('input.filter').forEach(function(f){f.addEventListener('input',function(){var q=f.value.toLowerCase();
+  document.querySelectorAll('#'+f.dataset.table+' tbody tr').forEach(function(r){r.style.display=r.textContent.toLowerCase().indexOf(q)>-1?'':'none'})})});
 """
 
 
@@ -653,6 +815,17 @@ def _th(text, num=False) -> str:
 def _table(head: List[str], rows: List[str], tid: str = "") -> str:
     return ('<div class="wrap"><table %sclass="sortable"><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>'
             % ('id="%s" ' % tid if tid else "", "".join(head), "".join(rows)))
+
+
+def _filter(tid: str, placeholder: str) -> str:
+    return '<input class="filter" data-table="%s" placeholder="%s">' % (tid, e(placeholder))
+
+
+def _clip_name(p: Pair) -> str:
+    name = "<b>%s</b>" % e(p.a.name)
+    if p.b.name != p.a.name:
+        name += "<br><span class='muted'>B: %s</span>" % e(p.b.name)
+    return name
 
 
 def clip_table(clips: List[Clip], opts: ReportOptions) -> str:
@@ -676,9 +849,9 @@ def clip_table(clips: List[Clip], opts: ReportOptions) -> str:
     return _table(head, rows)
 
 
-def ranked_table(flagged: List["Pair"], opts: ReportOptions) -> str:
+def duration_table(flagged: List[Pair], opts: ReportOptions) -> str:
     if not flagged:
-        return '<div class="wrap"><div class="empty">No duration differences — every matched clip has the same duration.</div></div>'
+        return '<div class="wrap"><div class="empty">No duration differences.</div></div>'
     max_abs = max(abs(p.diff) for p in flagged) or 1
     head = [_th("Rank", True), _th("Clip")]
     if opts.on("tape"): head.append(_th("Tape"))
@@ -698,11 +871,7 @@ def ranked_table(flagged: List["Pair"], opts: ReportOptions) -> str:
         d = p.diff
         cls = "long" if d > 0 else "short"
         note = "<div class='note'>%s</div>" % e(p.note) if p.note else ""
-        name = "<b>%s</b>" % e(p.a.name)
-        if p.b.name != p.a.name:
-            name += "<br><span class='muted'>B: %s</span>" % e(p.b.name)
-        if not opts.on("tape"):
-            name += note
+        name = _clip_name(p) + ("" if opts.on("tape") else note)
         r = [_td(i, "num", i), _td(name)]
         if opts.on("tape"): r.append(_td(e(p.tape) + note))
         if opts.on("dur_a"): r.append(_td(e(dur_tc(p.a)), "mono num", p.a.frames))
@@ -719,16 +888,52 @@ def ranked_table(flagged: List["Pair"], opts: ReportOptions) -> str:
             r.append(_td("<div class='bar' style='width:%.1f%%'></div>" % max(2.0, 100.0 * abs(d) / max_abs),
                          "barcell", abs(d)))
         rows.append("<tr>%s</tr>" % "".join(r))
-    return ('<input id="filter" class="filter" placeholder="Filter by clip or tape name…">'
-            + _table(head, rows, "ranked"))
+    return _filter("durations", "Filter by clip or tape name…") + _table(head, rows, "durations")
+
+
+def metadata_table(diffs: List[MetaDiff], opts: ReportOptions) -> str:
+    if not diffs:
+        return '<div class="wrap"><div class="empty">No metadata differences in the compared columns.</div></div>'
+    head = [_th("Clip")] + ([_th("Tape")] if opts.on("tape") else []) + [_th("Column"), _th("Bin A"), _th("Bin B")]
+    rows = []
+    for d in diffs:
+        p = d.pair
+        note = "<div class='note'>%s</div>" % e(p.note) if p.note else ""
+        r = [_td(_clip_name(p) + ("" if opts.on("tape") else note))]
+        if opts.on("tape"): r.append(_td(e(p.tape) + note))
+        r.append(_td("<b>%s</b>" % e(d.column)))
+        r.append(_td(e(d.a) if d.a else "<span class='muted'>(empty)</span>", "wrapcell va"))
+        r.append(_td(e(d.b) if d.b else "<span class='muted'>(empty)</span>", "wrapcell vb"))
+        rows.append("<tr>%s</tr>" % "".join(r))
+    return _filter("metadata", "Filter by clip, tape, column or value…") + _table(head, rows, "metadata")
+
+
+def by_column_table(res: Result) -> str:
+    counts = res.column_counts()
+    if not counts:
+        return '<div class="empty">No columns were compared.</div>'
+    top = max(counts.values()) or 1
+    rows = []
+    for col, n in counts.items():
+        cls = "" if n else "muted"
+        rows.append("<tr>%s%s%s</tr>" % (
+            _td(("<b>%s</b>" % e(col)) if n else e(col), cls),
+            _td(n, "num " + cls, n),
+            _td("<div class='bar' style='width:%.1f%%'></div>" % (100.0 * n / top) if n else "", "barcell", n)))
+    return _table([_th("Column"), _th("Clips that differ", True), _th("")], rows)
+
+
+def _chips(items: List[str]) -> str:
+    if not items:
+        return '<span class="muted">None</span>'
+    return '<div class="chips">%s</div>' % "".join('<span class="chip">%s</span>' % e(i) for i in items)
 
 
 def write_html(res: Result, path: str, opts: ReportOptions = None):
     opts = opts or ReportOptions()
     flagged = res.flagged
+    meta = res.meta_diffs
     fps_set = sorted({c.fps for c in res.a.clips + res.b.clips})
-    total_abs = sum(abs(p.diff) for p in flagged)
-    fps0 = fps_set[0] if fps_set else 24
 
     warnings = []
     if len(fps_set) > 1:
@@ -752,11 +957,15 @@ def write_html(res: Result, path: str, opts: ReportOptions = None):
         cards = [
             ("Clips in A", len(res.a.clips), ""), ("Clips in B", len(res.b.clips), ""),
             ("Matched by tape", len(res.pairs), ""),
-            ("Duration differences", len(flagged), "hot" if flagged else ""),
-            ("Biggest difference", signed_tc(biggest.diff, biggest.a.fps) if biggest else "—", "hot" if biggest else ""),
-            ("Total |difference|", frames_to_tc(total_abs, fps0) if flagged else "—", ""),
-            ("Only in A", len(res.only_a), ""), ("Only in B", len(res.only_b), ""),
+            ("Clips with differences", len(res.changed), "hot" if res.changed else ""),
         ]
+        if res.compare_duration:
+            cards += [("Duration differences", len(flagged), "hot" if flagged else ""),
+                      ("Biggest duration difference", signed_tc(biggest.diff, biggest.a.fps) if biggest else "—",
+                       "hot" if biggest else "")]
+        cards += [("Metadata differences", len(meta), "hot" if meta else ""),
+                  ("Columns compared", len(res.compared_columns) + (1 if res.compare_duration else 0), ""),
+                  ("Only in A", len(res.only_a), ""), ("Only in B", len(res.only_b), "")]
         if res.no_tape_a or res.no_tape_b:
             cards.append(("No tape name (A / B)", "%d / %d" % (len(res.no_tape_a), len(res.no_tape_b)), "hot"))
         parts.append('<div class="cards">%s</div>' % "".join(
@@ -764,7 +973,18 @@ def write_html(res: Result, path: str, opts: ReportOptions = None):
             for l, n, c in cards))
     parts.append(warn_html)
 
-    parts.append("<h2>Duration differences, ranked largest first (%d)</h2>%s" % (len(flagged), ranked_table(flagged, opts)))
+    if opts.on("by_column"):
+        parts.append("<h2>Differences by column</h2>%s" % by_column_table(res))
+    if opts.on("durations") and res.compare_duration:
+        parts.append("<h2>Duration differences, ranked largest first (%d)</h2>%s"
+                     % (len(flagged), duration_table(flagged, opts)))
+    if opts.on("metadata"):
+        parts.append("<h2>Metadata differences (%d)</h2>%s" % (len(meta), metadata_table(meta, opts)))
+    if opts.on("columns"):
+        parts.append("<h2>Columns not compared</h2>"
+                     "<p class='muted'>Only in bin A:</p>%s<p class='muted'>Only in bin B:</p>%s"
+                     "<p class='muted'>Turned off in settings:</p>%s"
+                     % (_chips(res.columns_only_a), _chips(res.columns_only_b), _chips(res.ignored_columns)))
     if opts.on("only_a"):
         parts.append("<h2>Only in A (%d)</h2>%s" % (len(res.only_a), clip_table(res.only_a, opts)))
     if opts.on("only_b"):
@@ -775,39 +995,44 @@ def write_html(res: Result, path: str, opts: ReportOptions = None):
     if opts.on("same"):
         if res.matching:
             head = [_th("Clip")] + ([_th("Tape")] if opts.on("tape") else []) + [_th("Duration", True)]
-            if res.tolerance: head.append(_th("Diff (fr)", True))
             rows = []
             for p in sorted(res.matching, key=lambda p: p.a.name.lower()):
                 r = [_td(e(p.a.name))] + ([_td(e(p.tape))] if opts.on("tape") else [])
                 r.append(_td(e(dur_tc(p.a)), "mono num", p.a.frames))
-                if res.tolerance: r.append(_td("%+d" % p.diff if p.diff else "0", "mono num", p.diff))
                 rows.append("<tr>%s</tr>" % "".join(r))
             same = ('<details><summary>Show %d clip(s)</summary><div style="margin-top:8px">%s</div></details>'
                     % (len(res.matching), _table(head, rows)))
         else:
             same = '<div class="empty">None</div>'
-        parts.append("<h2>Same duration (%d)</h2>%s" % (len(res.matching), same))
+        parts.append("<h2>Identical in every compared column (%d)</h2>%s" % (len(res.matching), same))
 
-    tol = (" Differences of %d frame(s) or less are ignored." % res.tolerance) if res.tolerance else ""
+    notes = []
+    if res.tolerance and res.compare_duration:
+        notes.append("Duration differences of %d frame(s) or less are ignored." % res.tolerance)
     doc = """<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Bin Duration Diff</title><style>%s</style></head>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>%s report</title><style>%s</style></head>
 <body><main>
-<h1>Bin duration report</h1>
-<p class="sub">Clips matched by tape name. Diff = Duration B − Duration A. Generated %s.%s</p>
+<h1>Bin comparison report</h1>
+<p class="sub">Clips are linked by tape name; every other shared column is compared. Generated %s. %s</p>
 %s
-<footer>Bin Duration Diff · by Alex Stuart</footer>
+<footer>%s · by Alex Stuart</footer>
 </main><script>%s</script></body></html>""" % (
-        CSS, e(_dt.datetime.now().strftime("%Y-%m-%d %H:%M")), e(tol), "\n".join(parts), JS)
+        APP_NAME, CSS, e(_dt.datetime.now().strftime("%Y-%m-%d %H:%M")), e(" ".join(notes)),
+        "\n".join(parts), APP_NAME, JS)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(doc)
 
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
 
 def print_summary(res: Result):
     flagged = res.flagged
     print("A: %s  (%d clips)" % (res.a.path, len(res.a.clips)))
     print("B: %s  (%d clips)" % (res.b.path, len(res.b.clips)))
-    print("Matched by tape: %d   Different: %d   Only in A: %d   Only in B: %d   No tape: %d/%d"
-          % (len(res.pairs), len(flagged), len(res.only_a), len(res.only_b),
+    print("Matched by tape: %d   With differences: %d   Only in A: %d   Only in B: %d   No tape: %d/%d"
+          % (len(res.pairs), len(res.changed), len(res.only_a), len(res.only_b),
              len(res.no_tape_a), len(res.no_tape_b)))
     if flagged:
         print("\nDuration differences, largest first (B - A):")
@@ -815,42 +1040,52 @@ def print_summary(res: Result):
         wt = max(len(p.tape) for p in flagged)
         for i, p in enumerate(flagged, 1):
             print("  %3d. %-*s  %-*s  %13s  %+6d fr   %s -> %s" % (
-                i, wn, p.a.name, wt, p.tape, ("+" if p.diff > 0 else "") + frames_to_tc(p.diff, p.a.fps),
-                p.diff, frames_to_tc(p.a.frames, p.a.fps), frames_to_tc(p.b.frames, p.b.fps)))
+                i, wn, p.a.name, wt, p.tape, signed_tc(p.diff, p.a.fps),
+                p.diff, dur_tc(p.a), dur_tc(p.b)))
+    meta = res.meta_diffs
+    if meta:
+        print("\nMetadata differences:")
+        for d in meta:
+            print("  %s [%s]  %s:  %r -> %r" % (d.pair.a.name, d.pair.tape, d.column, d.a, d.b))
+    not_compared = res.columns_only_a + res.columns_only_b
+    if not_compared:
+        print("\nColumns in only one bin (not compared): %s" % ", ".join(not_compared))
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Compare clip durations between two Avid bins, matched by tape name.")
+    ap = argparse.ArgumentParser(description="Compare two Avid bins, linking clips by tape name.")
     ap.add_argument("bin_a", help="First bin (.avb, .ale, or tab-delimited export)")
     ap.add_argument("bin_b", help="Second bin")
-    ap.add_argument("-o", "--output", help="HTML report path (default: <A>_vs_<B>_durations.html next to bin A)")
+    ap.add_argument("-o", "--output", help="HTML report path (default: <A>_vs_<B>_bindiff.html next to bin A)")
     ap.add_argument("--fps", type=float, default=24.0,
                     help="Frame rate for text exports that don't state one (default 24). .avb/.ale carry their own.")
-    ap.add_argument("--tolerance", type=int, default=0, help="Ignore differences of this many frames or fewer (default 0)")
+    ap.add_argument("--tolerance", type=int, default=0, help="Ignore duration differences of this many frames or fewer")
+    ap.add_argument("--ignore-columns", metavar="NAMES", help='Comma-separated columns not to compare, e.g. "Modified Date,Comments"')
+    ap.add_argument("--ignore-value-case", action="store_true", help="Treat metadata values that differ only in upper/lower case as equal")
     ap.add_argument("--include-subclips", action="store_true", help=".avb only: also compare subclips. By default only master clips are "
                          "compared, except in a bin with no master clips, where its subclips are used.")
     ap.add_argument("--case-sensitive", action="store_true", help="Treat tape names with different case as different tapes")
     ap.add_argument("--tape-column", help="Column name to use as the tape name in text exports")
     ap.add_argument("--duration-column", help="Column name to use as the duration in text exports")
     ap.add_argument("--no-csv", action="store_true", help="Don't write the CSV alongside the HTML report")
-    ap.add_argument("--open", action="store_true", help="Open the report in your browser when done")
     ap.add_argument("--hide", metavar="KEYS", help="Comma-separated report parts to leave out. Sections: %s. "
-                    "Columns: %s." % (", ".join(SECTIONS), ", ".join(COLUMNS)))
-    ap.add_argument("--show", metavar="KEYS", help="Comma-separated extra information to add: %s." % ", ".join(EXTRAS))
+                    "Duration table columns: %s." % (", ".join(SECTIONS), ", ".join(COLUMNS)))
+    ap.add_argument("--show", metavar="KEYS", help="Comma-separated extra duration-table columns: %s." % ", ".join(EXTRAS))
+    ap.add_argument("--open", action="store_true", help="Open the report in your browser when done")
     ap.add_argument("--json", action="store_true", help=argparse.SUPPRESS)  # used by the Mac app
     args = ap.parse_args(argv)
     opts = ReportOptions(hide=parse_keys(args.hide), show=parse_keys(args.show))
 
     a, b = load_bin(args.bin_a, args), load_bin(args.bin_b, args)
-    res = compare(a, b, args.tolerance, args.case_sensitive)
+    res = compare(a, b, args.tolerance, args.case_sensitive,
+                  split_list(args.ignore_columns), args.ignore_value_case)
 
     out = args.output
     if not out:
         stem = lambda p: os.path.splitext(os.path.basename(p))[0]
         out = os.path.join(os.path.dirname(os.path.abspath(args.bin_a)),
-                           "%s_vs_%s_durations.html" % (stem(args.bin_a), stem(args.bin_b)))
-    out_dir = os.path.dirname(os.path.abspath(out))
-    os.makedirs(out_dir, exist_ok=True)
+                           "%s_vs_%s_bindiff.html" % (stem(args.bin_a), stem(args.bin_b)))
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     write_html(res, out, opts)
     csv_path = None
     if not args.no_csv:
@@ -859,13 +1094,17 @@ def main(argv=None):
     if args.json:
         flagged = res.flagged
         top = flagged[0] if flagged else None
+        all_cols = list(a.columns) + [c for c in b.columns if c.lower() not in {x.lower() for x in a.columns}]
         print(json.dumps({
             "differences": len(flagged), "matched": len(res.pairs),
+            "clips_with_differences": len(res.changed), "metadata_differences": len(res.meta_diffs),
             "only_a": len(res.only_a), "only_b": len(res.only_b),
             "no_tape_a": len(res.no_tape_a), "no_tape_b": len(res.no_tape_b),
             "biggest_clip": top.a.name if top else None,
-            "biggest_tc": (("+" if top.diff > 0 else "") + frames_to_tc(top.diff, top.a.fps)) if top else None,
+            "biggest_tc": signed_tc(top.diff, top.a.fps) if top else None,
             "biggest_frames": top.diff if top else None,
+            "columns": all_cols,
+            "columns_only_a": res.columns_only_a, "columns_only_b": res.columns_only_b,
             "report": os.path.abspath(out), "csv": csv_path and os.path.abspath(csv_path),
         }))
     else:

@@ -14,6 +14,12 @@ struct Summary: Decodable {
     let biggest_frames: Int?
     let report: String
     let csv: String?
+    // Added in 2.0 (optional so an older engine's output still decodes)
+    let clips_with_differences: Int?
+    let metadata_differences: Int?
+    let columns: [String]?
+    let columns_only_a: [String]?
+    let columns_only_b: [String]?
 }
 
 enum EngineError: LocalizedError {
@@ -29,6 +35,9 @@ func engineOptions(fps: String) -> [String] {
     if Prefs.bool(Prefs.caseSensitive, false) { args.append("--case-sensitive") }
     if Prefs.bool(Prefs.includeSubclips, false) { args.append("--include-subclips") }
     if !Prefs.bool(Prefs.writeCSV, true) { args.append("--no-csv") }
+    if Prefs.bool(Prefs.ignoreValueCase, false) { args.append("--ignore-value-case") }
+    let ignored = ColumnPrefs.shared.ignored.filter { !$0.contains(",") }
+    if !ignored.isEmpty { args += ["--ignore-columns", ignored.joined(separator: ",")] }
     let hide = ReportParts.defaultOn.filter { !ReportParts.isOn($0) }
     let show = ReportParts.extras.map { $0.0 }.filter { ReportParts.isOn($0) }
     if !hide.isEmpty { args += ["--hide", hide.joined(separator: ",")] }
@@ -36,7 +45,8 @@ func engineOptions(fps: String) -> [String] {
     return args
 }
 
-func runEngine(binA: URL, binB: URL, fps: String) throws -> Summary {
+/// `options` comes from engineOptions(fps:), read on the main thread.
+func runEngine(binA: URL, binB: URL, options: [String]) throws -> Summary {
     guard let engine = Bundle.main.resourceURL?.appendingPathComponent("engine/bin_diff_engine"),
           FileManager.default.isExecutableFile(atPath: engine.path) else {
         throw EngineError.message("The comparison engine is missing from the app. Rebuild it with build_app.sh.")
@@ -50,7 +60,7 @@ func runEngine(binA: URL, binB: URL, fps: String) throws -> Summary {
 
     let p = Process()
     p.executableURL = engine
-    p.arguments = [binA.path, binB.path, "-o", out.path, "--json"] + engineOptions(fps: fps)
+    p.arguments = [binA.path, binB.path, "-o", out.path, "--json"] + options
     let stdout = Pipe(), stderr = Pipe()
     p.standardOutput = stdout
     p.standardError = stderr

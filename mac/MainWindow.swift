@@ -30,9 +30,9 @@ struct ContentView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 2) {
-                Text("Compare clip durations between two bins")
+                Text("Compare two bins")
                     .font(.title2).bold()
-                Text("Clips are matched by tape name. Choose a bin for each side, or drag bins in from Finder.")
+                Text("Clips are linked by tape name, and every other column is compared. Choose a bin for each side, or drag bins in from Finder.")
                     .foregroundColor(.secondary)
             }
 
@@ -96,16 +96,17 @@ struct ContentView: View {
             return
         }
         running = true; errorText = nil; summary = nil
-        let rate = fps
+        let options = engineOptions(fps: fps)
         let open = openReport
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = Result { try runEngine(binA: a, binB: b, fps: rate) }
+            let result = Result { try runEngine(binA: a, binB: b, options: options) }
             DispatchQueue.main.async {
                 running = false
                 switch result {
                 case .success(let s):
                     summary = s
                     AppState.shared.lastError = nil
+                    ColumnPrefs.shared.remember(s.columns ?? [])
                     if open { NSWorkspace.shared.open(URL(fileURLWithPath: s.report)) }
                 case .failure(let err):
                     errorText = err.localizedDescription
@@ -120,9 +121,16 @@ struct ResultBox: View {
     let summary: Summary
 
     var headline: String {
-        let n = summary.differences
-        if n == 0 { return "No duration differences." }
-        return "\(n) clip\(n == 1 ? "" : "s") with a different duration."
+        let n = summary.clips_with_differences ?? summary.differences
+        if n == 0 { return "No differences in the compared columns." }
+        return "\(n) clip\(n == 1 ? "" : "s") with differences."
+    }
+
+    var breakdown: String {
+        var parts = ["Durations: \(summary.differences)"]
+        if let m = summary.metadata_differences { parts.append("Other columns: \(m)") }
+        if let clip = summary.biggest_clip, let tc = summary.biggest_tc { parts.append("Biggest: \(clip) \(tc)") }
+        return parts.joined(separator: "   ·   ")
     }
 
     var body: some View {
@@ -130,9 +138,7 @@ struct ResultBox: View {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(headline).bold()
-                    if let clip = summary.biggest_clip, let tc = summary.biggest_tc {
-                        Text("Biggest: \(clip)  \(tc)")
-                    }
+                    Text(breakdown)
                     Text(details).foregroundColor(.secondary).font(.callout)
                 }
                 Spacer()
